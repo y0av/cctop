@@ -1,0 +1,43 @@
+# cctop
+
+A [btop](https://github.com/aristocratos/btop)-style terminal monitor for your Claude usage and running Claude Code agents.
+
+![cctop](assets/screenshot.png)
+
+Instead of keeping the **claude.ai usage tab** open in your browser, run `cctop` and watch your plan limits, token spend, and every running Claude Code agent right in your terminal — live.
+
+## Install
+
+```sh
+cargo install --git https://github.com/y0av/cctop
+```
+
+Then just run:
+
+```sh
+cctop
+```
+
+## What it shows
+
+- **Plan** — your live 5-hour and weekly limits (the same gauges as *claude.ai/settings/usage*) with reset timers. Falls back to a local estimate when offline.
+- **Live agents** — every running Claude Code session as a process row: project, model, busy/idle, uptime, memory, and a live token-burn sparkline.
+- **Usage** — today's tokens and cost, main-vs-subagent split, and lifetime breakdowns by model and project.
+
+Token data is read locally from `~/.claude`; the live plan gauges reuse your existing Claude Code OAuth login (Pro/Max). Nothing leaves your machine except the same usage request the CLI already makes.
+
+## Keys
+
+`q` quit · `↑ ↓` select · `s` cycle sort · `r` refresh
+
+## Flags
+
+| flag | what it does |
+|------|--------------|
+| `--demo` | run with synthetic data — no account needed |
+| `--no-net` | local data only, never touch the network |
+| `--once` | print a one-shot text snapshot and exit |
+
+## License
+
+MIT

@@ -1,0 +1,28 @@
+[package]
+name = "cctop"
+version = "0.1.0"
+edition = "2021"
+description = "btop-style terminal monitor for Claude usage & running Claude Code agents"
+license = "MIT"
+repository = "https://github.com/y0av/cctop"
+readme = "README.md"
+keywords = ["claude", "tui", "monitor", "usage", "btop"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "cctop"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "5"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
