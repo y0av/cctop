@@ -8,10 +8,18 @@ Instead of keeping the **claude.ai usage tab** open in your browser, run `cctop`
 
 ## Install
 
-**Quick install** (Linux/macOS, prebuilt binary — no Rust needed):
+**Quick install** — prebuilt binary, no Rust needed.
+
+Linux / macOS (Intel & Apple Silicon):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/y0av/cctop/master/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/y0av/cctop/master/install.ps1 | iex
 ```
 
 The rest of the options need a [Rust toolchain](https://rustup.rs) (`cargo`). No system libraries — TLS is bundled (rustls).
@@ -51,6 +59,8 @@ cctop
 - **Usage** — today's tokens and cost, main-vs-subagent split, and lifetime breakdowns by model and project.
 
 Token data is read locally from `~/.claude`; the live plan gauges reuse your existing Claude Code OAuth login (Pro/Max). Nothing leaves your machine except the same usage request the CLI already makes.
+
+> **Platform note:** plan gauges and usage history work on Linux, macOS and Windows. The live **process** panel (PID/memory/liveness) currently reads Linux `/proc`, so on macOS/Windows that panel stays empty — everything else works.
 
 ## Keys
 

@@ -7,6 +7,7 @@
 //! `seven_day_sonnet`, each `{utilization, resets_at}`.
 
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -219,6 +220,8 @@ fn write_back(path: &Path, new: &NewCreds) -> Result<(), String> {
     let tmp = dir.join(".credentials.json.cctop.tmp");
     {
         let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        // Keep the credentials file owner-only on Unix; Windows inherits NTFS ACLs.
+        #[cfg(unix)]
         f.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
         f.write_all(serialized.as_bytes()).map_err(|e| e.to_string())?;
         f.sync_all().map_err(|e| e.to_string())?;
