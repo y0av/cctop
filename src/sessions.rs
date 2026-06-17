@@ -61,12 +61,9 @@ pub fn read(sessions_dir: &Path, store: &Store, now_ms: i64) -> Vec<LiveAgent> {
     sys.refresh_processes(ProcessesToUpdate::Some(&pids), true);
 
     for sf in candidates {
-        let Some((rss_kb, alive)) = process_info(&sys, sf.pid) else {
+        let Some(rss_kb) = process_info(&sys, sf.pid) else {
             continue; // no such process — stale registry entry for a dead process
         };
-        if !alive {
-            continue; // PID was recycled by some non-claude process
-        }
         let session_id = sf.session_id.unwrap_or_default();
         let cwd = sf.cwd.unwrap_or_default();
         let started = sf.started_at.unwrap_or(now_ms);
@@ -109,20 +106,18 @@ pub fn read(sessions_dir: &Path, store: &Store, now_ms: i64) -> Vec<LiveAgent> {
     out
 }
 
-/// Look up a PID in the refreshed process table.
+/// Look up a live PID in the refreshed process table, returning its resident
+/// set size in KiB (the UI's unit; sysinfo reports bytes).
 ///
-/// Returns `None` if no such process exists (a stale registry entry). Otherwise
-/// returns `(resident_set_kib, is_claude)`, where `is_claude` guards against a
-/// PID having been recycled by an unrelated process. Works on Linux, macOS and
-/// Windows; the executable is `claude` (`claude.exe` on Windows).
-fn process_info(sys: &System, pid: i32) -> Option<(u64, bool)> {
+/// Returns `None` if no such process exists — a stale registry entry for a dead
+/// session. We deliberately don't check the executable name: Claude Code may be
+/// launched under a wrapper (e.g. a `node`-spawned process) whose name isn't
+/// `claude`, and the session file is authored by Claude itself, so process
+/// existence is a sufficient liveness signal. Works on Linux, macOS and Windows.
+fn process_info(sys: &System, pid: i32) -> Option<u64> {
     if pid < 0 {
         return None;
     }
     let proc_ = sys.process(Pid::from_u32(pid as u32))?;
-    let name = proc_.name().to_string_lossy().to_ascii_lowercase();
-    let is_claude = name == "claude" || name == "claude.exe" || name.starts_with("claude");
-    // sysinfo reports memory in bytes; the UI wants KiB.
-    let rss_kb = proc_.memory() / 1024;
-    Some((rss_kb, is_claude))
+    Some(proc_.memory() / 1024)
 }
