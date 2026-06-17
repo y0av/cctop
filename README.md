@@ -8,9 +8,15 @@ Instead of keeping the **claude.ai usage tab** open in your browser, run `cctop`
 
 ## Install
 
-Needs a [Rust toolchain](https://rustup.rs) (`cargo`). No system libraries — TLS is bundled (rustls).
+**Quick install** (Linux/macOS, prebuilt binary — no Rust needed):
 
-**From git (recommended):**
+```sh
+curl -fsSL https://raw.githubusercontent.com/y0av/cctop/master/install.sh | sh
+```
+
+The rest of the options need a [Rust toolchain](https://rustup.rs) (`cargo`). No system libraries — TLS is bundled (rustls).
+
+**From git:**
 
 ```sh
 cargo install --git https://github.com/y0av/cctop
