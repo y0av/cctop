@@ -8,11 +8,31 @@ Instead of keeping the **claude.ai usage tab** open in your browser, run `cctop`
 
 ## Install
 
+Needs a [Rust toolchain](https://rustup.rs) (`cargo`). No system libraries — TLS is bundled (rustls).
+
+**From git (recommended):**
+
 ```sh
 cargo install --git https://github.com/y0av/cctop
 ```
 
-Then just run:
+**From source:**
+
+```sh
+git clone https://github.com/y0av/cctop
+cd cctop
+cargo install --path .
+```
+
+**Just build, don't install:**
+
+```sh
+git clone https://github.com/y0av/cctop && cd cctop
+cargo build --release
+./target/release/cctop
+```
+
+Either install puts `cctop` on your `PATH` (`~/.cargo/bin`). Then just run:
 
 ```sh
 cctop
