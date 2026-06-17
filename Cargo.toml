@@ -1,6 +1,6 @@
 [package]
 name = "cctop"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "btop-style terminal monitor for Claude usage & running Claude Code agents"
 license = "MIT"
@@ -21,6 +21,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 dirs = "5"
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 [profile.release]
 opt-level = 3

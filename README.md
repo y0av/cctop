@@ -60,7 +60,7 @@ cctop
 
 Token data is read locally from `~/.claude`; the live plan gauges reuse your existing Claude Code OAuth login (Pro/Max). Nothing leaves your machine except the same usage request the CLI already makes.
 
-> **Platform note:** plan gauges and usage history work on Linux, macOS and Windows. The live **process** panel (PID/memory/liveness) currently reads Linux `/proc`, so on macOS/Windows that panel stays empty — everything else works.
+Works on Linux, macOS and Windows.
 
 ## Keys
 

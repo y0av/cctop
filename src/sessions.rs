@@ -1,10 +1,11 @@
 //! Discovers running Claude Code sessions from `~/.claude/sessions/<pid>.json`,
-//! confirms liveness via `/proc`, and joins each to its transcript-derived
-//! model and live token burn.
+//! confirms liveness via the OS process table (cross-platform via `sysinfo`),
+//! and joins each to its transcript-derived model and live token burn.
 
 use std::path::Path;
 
 use serde::Deserialize;
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 use crate::transcripts::{self, Store};
 
@@ -42,21 +43,29 @@ pub fn read(sessions_dir: &Path, store: &Store, now_ms: i64) -> Vec<LiveAgent> {
         Ok(rd) => rd,
         Err(_) => return out,
     };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let txt = match std::fs::read_to_string(&p) {
-            Ok(t) => t,
-            Err(_) => continue,
+
+    // Parse every session file first, then resolve liveness/memory for all of
+    // their PIDs in one OS process-table query (cheaper than one query per PID).
+    let candidates: Vec<SessionFile> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .filter_map(|p| std::fs::read_to_string(&p).ok())
+        .filter_map(|txt| serde_json::from_str::<SessionFile>(&txt).ok())
+        .collect();
+
+    let pids: Vec<Pid> = candidates.iter().map(|c| Pid::from_u32(c.pid as u32)).collect();
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_memory()),
+    );
+    sys.refresh_processes(ProcessesToUpdate::Some(&pids), true);
+
+    for sf in candidates {
+        let Some((rss_kb, alive)) = process_info(&sys, sf.pid) else {
+            continue; // no such process — stale registry entry for a dead process
         };
-        let sf: SessionFile = match serde_json::from_str(&txt) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if !is_claude_alive(sf.pid) {
-            continue; // stale registry entry for a dead process
+        if !alive {
+            continue; // PID was recycled by some non-claude process
         }
         let session_id = sf.session_id.unwrap_or_default();
         let cwd = sf.cwd.unwrap_or_default();
@@ -83,7 +92,7 @@ pub fn read(sessions_dir: &Path, store: &Store, now_ms: i64) -> Vec<LiveAgent> {
             model,
             status: sf.status.unwrap_or_else(|| "?".to_string()),
             uptime_secs,
-            rss_kb: read_rss_kb(sf.pid).unwrap_or(0),
+            rss_kb,
             burn_tps,
             burn_hist,
             kind: sf.kind.unwrap_or_default(),
@@ -100,18 +109,20 @@ pub fn read(sessions_dir: &Path, store: &Store, now_ms: i64) -> Vec<LiveAgent> {
     out
 }
 
-/// True if `/proc/<pid>/comm` reports a live `claude` process.
-fn is_claude_alive(pid: i32) -> bool {
-    match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-        Ok(s) => s.trim() == "claude",
-        Err(_) => false,
+/// Look up a PID in the refreshed process table.
+///
+/// Returns `None` if no such process exists (a stale registry entry). Otherwise
+/// returns `(resident_set_kib, is_claude)`, where `is_claude` guards against a
+/// PID having been recycled by an unrelated process. Works on Linux, macOS and
+/// Windows; the executable is `claude` (`claude.exe` on Windows).
+fn process_info(sys: &System, pid: i32) -> Option<(u64, bool)> {
+    if pid < 0 {
+        return None;
     }
-}
-
-/// Resident set size in KiB from `/proc/<pid>/statm` (field 2 = resident pages).
-fn read_rss_kb(pid: i32) -> Option<u64> {
-    let s = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
-    let resident_pages: u64 = s.split_whitespace().nth(1)?.parse().ok()?;
-    // Linux page size is 4 KiB on this platform.
-    Some(resident_pages * 4)
+    let proc_ = sys.process(Pid::from_u32(pid as u32))?;
+    let name = proc_.name().to_string_lossy().to_ascii_lowercase();
+    let is_claude = name == "claude" || name == "claude.exe" || name.starts_with("claude");
+    // sysinfo reports memory in bytes; the UI wants KiB.
+    let rss_kb = proc_.memory() / 1024;
+    Some((rss_kb, is_claude))
 }
