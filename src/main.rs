@@ -59,6 +59,11 @@ struct Args {
     /// Write an HTML screenshot of the demo frame to FILE and exit.
     #[arg(long, value_name = "FILE")]
     snapshot: Option<PathBuf>,
+    /// Extra Claude config dir to also read (repeatable). Pass the dir that
+    /// holds `projects/` and `sessions/` — e.g. a CLAUDE_CONFIG_DIR sandbox.
+    /// Also settable via the CCTOP_CONFIG_DIRS path-list env var.
+    #[arg(long = "config-dir", value_name = "DIR")]
+    config_dir: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -91,7 +96,8 @@ enum NetMsg {
 }
 
 struct App {
-    sessions_dir: PathBuf,
+    sessions_dirs: Vec<PathBuf>,
+    n_sources: usize,
     creds_path: PathBuf,
     store: Store,
     account: Account,
@@ -127,7 +133,7 @@ impl App {
         self.store.refresh();
         let (now_s, now_ms, today) = now_parts();
         self.agg = self.store.aggregate(now_s, today);
-        let mut agents = sessions::read(&self.sessions_dir, &self.store, now_ms);
+        let mut agents = sessions::read(&self.sessions_dirs, &self.store, now_ms);
         apply_sort(&mut agents, self.sort);
         let len = agents.len();
         self.agents = agents;
@@ -186,6 +192,40 @@ impl App {
     }
 }
 
+/// Resolve the Claude config directories cctop should read.
+///
+/// The base is `$CLAUDE_CONFIG_DIR` when set, otherwise `~/.claude` — matching
+/// Claude Code's own resolution, so a lone cctop reads exactly what `claude`
+/// would in the same shell. Additional config dirs (each a `.claude`-style dir
+/// holding `projects/`, `sessions/` and `.credentials.json`) can be supplied —
+/// cross-platform — via the repeatable `--config-dir` flag and the
+/// `CCTOP_CONFIG_DIRS` env var (a `:`-separated path list on Unix, `;` on
+/// Windows). The base comes first and is always kept; extra dirs are ignored
+/// unless they exist (so a typo or stale path can't inflate the source count),
+/// and duplicates collapse by canonical path. With none of these set this
+/// returns exactly `[~/.claude]`, identical to the previous hard-coded behavior.
+fn config_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
+    let base = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".claude"));
+
+    let mut roots: Vec<PathBuf> = vec![base];
+    let from_env = std::env::var_os("CCTOP_CONFIG_DIRS")
+        .map(|l| std::env::split_paths(&l).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for d in from_env.into_iter().chain(extra.iter().cloned()) {
+        if !d.as_os_str().is_empty() && d.is_dir() {
+            roots.push(d);
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    roots
+        .into_iter()
+        .filter(|d| seen.insert(std::fs::canonicalize(d).unwrap_or_else(|_| d.clone())))
+        .collect()
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -194,17 +234,22 @@ fn main() {
         return;
     }
 
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let creds_path = home.join(".claude/.credentials.json");
-    let sessions_dir = home.join(".claude/sessions");
-    let projects_root = home.join(".claude/projects");
+    let roots = config_dirs(&args.config_dir);
+    let n_sources = roots.len();
+    // The base (first) dir owns the account identity + live plan gauges; extra
+    // dirs only contribute transcripts and live agents.
+    let base = roots.first().cloned().unwrap_or_else(|| PathBuf::from(".claude"));
+    let creds_path = base.join(".credentials.json");
+    let sessions_dirs: Vec<PathBuf> = roots.iter().map(|d| d.join("sessions")).collect();
+    let projects_roots: Vec<PathBuf> = roots.iter().map(|d| d.join("projects")).collect();
 
     let (tx, rx) = mpsc::channel();
     let mut app = App {
-        sessions_dir,
+        sessions_dirs,
+        n_sources,
         creds_path: creds_path.clone(),
-        store: Store::new(projects_root),
-        account: account::read_account(&home),
+        store: Store::new(projects_roots),
+        account: account::read_account(&base),
         agg: empty_aggregates(),
         agents: Vec::new(),
         usage: estimate(&empty_aggregates(), Some("starting…".to_string())),
@@ -278,8 +323,9 @@ fn run_tui(app: &mut App, rx: &mpsc::Receiver<NetMsg>, refresh_ms: u64) -> std::
     let res = loop {
         app.drain_net(rx);
         let sort_label = app.sort.label();
+        let n_sources = app.n_sources;
         term.draw(|f| {
-            ui::draw(f, &app.account, &app.agg, &app.agents, &app.usage, &mut app.table, sort_label)
+            ui::draw(f, &app.account, &app.agg, &app.agents, &app.usage, &mut app.table, sort_label, n_sources)
         })?;
 
         let timeout = tick.saturating_sub(last.elapsed());
@@ -408,7 +454,11 @@ fn print_once(app: &App) {
     }
 
     println!();
-    println!("LIVE AGENTS ({} running)", app.agents.len());
+    if app.n_sources > 1 {
+        println!("LIVE AGENTS ({} running · {} config dirs)", app.agents.len(), app.n_sources);
+    } else {
+        println!("LIVE AGENTS ({} running)", app.agents.len());
+    }
     println!("  {:<8} {:<18} {:<11} {:<6} {:>8} {:>8} {:>8}", "PID", "PROJECT", "MODEL", "ST", "UP", "MEM", "tok/s");
     for ag in &app.agents {
         println!(

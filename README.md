@@ -58,7 +58,7 @@ cctop
 - **Live agents** — every running Claude Code session as a process row: project, model, busy/idle, uptime, memory, and a live token-burn sparkline.
 - **Usage** — today's tokens and cost, main-vs-subagent split, and lifetime breakdowns by model and project.
 
-Token data is read locally from `~/.claude`; the live plan gauges reuse your existing Claude Code OAuth login (Pro/Max). Nothing leaves your machine except the same usage request the CLI already makes.
+Token data is read locally from `~/.claude` (and any extra dirs you point it at — see [Multiple config dirs](#multiple-config-dirs)); the live plan gauges reuse your existing Claude Code OAuth login (Pro/Max). Nothing leaves your machine except the same usage request the CLI already makes.
 
 Works on Linux, macOS and Windows.
 
@@ -73,6 +73,24 @@ Works on Linux, macOS and Windows.
 | `--demo` | run with synthetic data — no account needed |
 | `--no-net` | local data only, never touch the network |
 | `--once` | print a one-shot text snapshot and exit |
+| `--config-dir DIR` | also read another Claude config dir (repeatable) — see [Multiple config dirs](#multiple-config-dirs) |
+
+## Multiple config dirs
+
+By default cctop reads the same config dir Claude Code itself uses: `$CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
+
+If you run Claude Code under more than one config dir — a sandbox launched with a custom `CLAUDE_CONFIG_DIR`, or a second account — point cctop at the extras to watch **all** of their agents and token usage in one view. Pass the dir that contains `projects/` and `sessions/`:
+
+```sh
+# repeatable flag
+cctop --config-dir ~/envs/sandbox/claude
+
+# or, persistently, via an env var — a path list (':' on Unix, ';' on Windows)
+export CCTOP_CONFIG_DIRS=~/envs/sandbox/claude:~/envs/other/claude
+cctop
+```
+
+Live agents and token totals are merged across every dir (duplicates collapse, missing dirs are ignored); the header account and live plan gauges follow the base dir. When more than one dir is active the footer shows `src:N`. With nothing extra set, behavior is unchanged — just `~/.claude`.
 
 ## License
 

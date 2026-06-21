@@ -31,7 +31,7 @@ struct FileState {
 }
 
 pub struct Store {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
     files: HashMap<PathBuf, FileState>,
     seen: HashSet<u64>,
     pub records: Vec<Record>,
@@ -40,9 +40,9 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(roots: Vec<PathBuf>) -> Self {
         Store {
-            root,
+            roots,
             files: HashMap::new(),
             seen: HashSet::new(),
             records: Vec::new(),
@@ -50,10 +50,14 @@ impl Store {
         }
     }
 
-    /// Walk the projects tree and ingest any newly-appended bytes.
+    /// Walk every projects tree and ingest any newly-appended bytes. Per-file
+    /// offsets and the dedup set are keyed globally, so overlapping roots (or a
+    /// file reachable from two roots) are counted exactly once.
     pub fn refresh(&mut self) {
         let mut paths = Vec::new();
-        collect_jsonl(&self.root, &mut paths);
+        for root in &self.roots {
+            collect_jsonl(root, &mut paths);
+        }
         for path in paths {
             if let Err(_e) = self.ingest_file(&path) {
                 // A transient read error (file rotated mid-read) just means we

@@ -2,7 +2,7 @@
 //! confirms liveness via the OS process table (cross-platform via `sysinfo`),
 //! and joins each to its transcript-derived model and live token burn.
 
-use std::path::Path;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
@@ -36,23 +36,29 @@ pub struct LiveAgent {
     pub kind: String,
 }
 
-/// Read all session files, drop dead ones, and enrich the survivors.
-pub fn read(sessions_dir: &Path, store: &Store, now_ms: i64) -> Vec<LiveAgent> {
+/// Read all session files across every config dir, drop dead ones, and enrich
+/// the survivors.
+pub fn read(sessions_dirs: &[PathBuf], store: &Store, now_ms: i64) -> Vec<LiveAgent> {
     let mut out = Vec::new();
-    let rd = match std::fs::read_dir(sessions_dir) {
-        Ok(rd) => rd,
-        Err(_) => return out,
-    };
 
-    // Parse every session file first, then resolve liveness/memory for all of
-    // their PIDs in one OS process-table query (cheaper than one query per PID).
-    let candidates: Vec<SessionFile> = rd
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-        .filter_map(|p| std::fs::read_to_string(&p).ok())
-        .filter_map(|txt| serde_json::from_str::<SessionFile>(&txt).ok())
-        .collect();
+    // Parse every session file (across all config dirs) first, then resolve
+    // liveness/memory for all PIDs in one OS process-table query (cheaper than
+    // one query per PID). PIDs are OS-global, so sessions from different config
+    // dirs never collide.
+    let mut candidates: Vec<SessionFile> = Vec::new();
+    for dir in sessions_dirs {
+        let rd = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        candidates.extend(
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+                .filter_map(|p| std::fs::read_to_string(&p).ok())
+                .filter_map(|txt| serde_json::from_str::<SessionFile>(&txt).ok()),
+        );
+    }
 
     let pids: Vec<Pid> = candidates.iter().map(|c| Pid::from_u32(c.pid as u32)).collect();
     let mut sys = System::new_with_specifics(

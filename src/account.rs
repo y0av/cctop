@@ -32,7 +32,9 @@ pub struct Account {
     pub rate_limit_tier: String,
 }
 
-pub fn read_account(home: &Path) -> Account {
+/// Local account identity for one config dir, read from its `.claude.json`
+/// identity blob + `.credentials.json`.
+pub fn read_account(config_dir: &Path) -> Account {
     let mut acc = Account {
         display_name: String::new(),
         email: String::new(),
@@ -40,7 +42,7 @@ pub fn read_account(home: &Path) -> Account {
         subscription: String::new(),
         rate_limit_tier: String::new(),
     };
-    if let Ok(txt) = std::fs::read_to_string(home.join(".claude.json")) {
+    if let Ok(txt) = std::fs::read_to_string(account_json_path(config_dir)) {
         if let Ok(v) = serde_json::from_str::<Value>(&txt) {
             if let Some(o) = v.get("oauthAccount") {
                 acc.display_name =
@@ -51,11 +53,22 @@ pub fn read_account(home: &Path) -> Account {
             }
         }
     }
-    if let Ok(c) = read_creds(&home.join(".claude/.credentials.json")) {
+    if let Ok(c) = read_creds(&config_dir.join(".credentials.json")) {
         acc.subscription = c.subscription_type;
         acc.rate_limit_tier = c.rate_limit_tier;
     }
     acc
+}
+
+/// Locate the `.claude.json` identity blob for a config dir. Under
+/// `CLAUDE_CONFIG_DIR` it sits inside the config dir; for the default
+/// `~/.claude` layout it lives beside it at the parent (`~/.claude.json`).
+fn account_json_path(config_dir: &Path) -> PathBuf {
+    let inside = config_dir.join(".claude.json");
+    if inside.exists() {
+        return inside;
+    }
+    config_dir.parent().map(|p| p.join(".claude.json")).unwrap_or(inside)
 }
 
 struct Creds {

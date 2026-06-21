@@ -15,7 +15,7 @@ use crate::theme;
 use crate::transcripts::Aggregates;
 
 pub fn draw(f: &mut Frame, account: &Account, agg: &Aggregates, agents: &[LiveAgent],
-            usage: &UsageWindows, state: &mut TableState, sort_label: &str) {
+            usage: &UsageWindows, state: &mut TableState, sort_label: &str, n_sources: usize) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -31,7 +31,7 @@ pub fn draw(f: &mut Frame, account: &Account, agg: &Aggregates, agents: &[LiveAg
     gauges(f, chunks[1], usage);
     agents_table(f, chunks[2], agents, state);
     bottom(f, chunks[3], agg);
-    footer(f, chunks[4], usage, agents.len(), sort_label);
+    footer(f, chunks[4], usage, n_sources, sort_label);
 }
 
 fn header(f: &mut Frame, area: Rect, account: &Account) {
@@ -296,12 +296,12 @@ fn bars_panel(f: &mut Frame, area: Rect, title: &'static str, items: &[(String, 
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn footer(f: &mut Frame, area: Rect, usage: &UsageWindows, _n: usize, sort_label: &str) {
+fn footer(f: &mut Frame, area: Rect, usage: &UsageWindows, n_sources: usize, sort_label: &str) {
     let net = match usage.source {
         UsageSource::Live => Span::styled("net:LIVE", Style::default().fg(theme::GREEN)),
         UsageSource::Estimate => Span::styled("net:EST", Style::default().fg(theme::MAGENTA)),
     };
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(" [q]", Style::default().fg(theme::CYAN)),
         Span::styled("uit  ", Style::default().fg(theme::DIM)),
         Span::styled("[↑↓]", Style::default().fg(theme::CYAN)),
@@ -311,8 +311,13 @@ fn footer(f: &mut Frame, area: Rect, usage: &UsageWindows, _n: usize, sort_label
         Span::styled("[r]", Style::default().fg(theme::CYAN)),
         Span::styled("efresh   ", Style::default().fg(theme::DIM)),
         net,
-    ]);
-    f.render_widget(Paragraph::new(line).alignment(Alignment::Left), area);
+    ];
+    // Only surfaced when reading more than the default dir, so the common
+    // single-config footer stays exactly as it was.
+    if n_sources > 1 {
+        spans.push(Span::styled(format!("  src:{n_sources}"), Style::default().fg(theme::DIM)));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)).alignment(Alignment::Left), area);
 }
 
 fn model_short(m: &str) -> String {
