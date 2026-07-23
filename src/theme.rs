@@ -240,6 +240,42 @@ pub fn spark(values: &[u64], width: usize) -> String {
     s
 }
 
+/// A `width`×`height` column chart of `values` using eighth-block glyphs,
+/// returned top row first. Values are right-aligned (newest last); any
+/// non-zero value shows at least a baseline sliver.
+pub fn columns(values: &[u64], width: usize, height: usize) -> Vec<String> {
+    let slice: &[u64] = if values.len() > width { &values[values.len() - width..] } else { values };
+    let max = slice.iter().copied().max().unwrap_or(0).max(1);
+    let pad = width.saturating_sub(slice.len());
+    let mut rows = vec![" ".repeat(pad); height];
+    for &v in slice {
+        let mut lvl = ((v as f64 / max as f64) * (height * 8) as f64).round() as usize;
+        if v > 0 {
+            lvl = lvl.max(1);
+        }
+        for (r, row) in rows.iter_mut().enumerate() {
+            let below = (height - 1 - r) * 8; // eighths consumed by lower rows
+            row.push(match lvl.saturating_sub(below) {
+                0 => ' ',
+                x @ 1..=8 => SPARK[x - 1],
+                _ => '█',
+            });
+        }
+    }
+    rows
+}
+
+/// Compact dollar amount: $3.20 / $42 / $312 / $11.8k.
+pub fn money(v: f64) -> String {
+    if v >= 10_000.0 {
+        format!("${:.1}k", v / 1000.0)
+    } else if v >= 100.0 {
+        format!("${v:.0}")
+    } else {
+        format!("${v:.2}")
+    }
+}
+
 /// Human-readable token count: 1.2M / 982k / 42.
 pub fn human(n: u64) -> String {
     let f = n as f64;

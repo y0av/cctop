@@ -37,6 +37,10 @@ pub struct Window {
     pub utilization: Option<f64>,
     pub tokens: Option<u64>,
     pub resets_at: Option<DateTime<Utc>>,
+    /// Seconds until this window hits 100% at the current climb rate,
+    /// derived from live utilization samples. Only set when that moment
+    /// lands *before* the reset — i.e. when it's an actionable warning.
+    pub eta_secs: Option<i64>,
 }
 
 /// A model-scoped weekly window (e.g. the Fable or Opus weekly cap), labeled
@@ -69,6 +73,23 @@ pub enum UsageSource {
 pub struct PlanView {
     pub label: String,
     pub usage: UsageWindows,
+}
+
+/// Everything the drill-down panel shows about the selected agent.
+pub struct AgentDetail {
+    pub project: String,
+    pub account: String,
+    pub model: String,
+    pub session_id: String,
+    pub cwd: String,
+    pub status: String,
+    pub uptime_secs: i64,
+    /// Seconds since the session's last assistant turn, when known.
+    pub idle_secs: Option<i64>,
+    pub tok: Tokens,
+    pub cost: f64,
+    pub burn_tps: f64,
+    pub burn_hist: Vec<u64>,
 }
 
 /// The full set of plan gauges shown in the header block.

@@ -213,7 +213,7 @@ fn window_from_limit(l: &Value) -> Option<Window> {
         .and_then(Value::as_str)
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.with_timezone(&Utc));
-    Some(Window { utilization: Some(utilization), tokens: None, resets_at })
+    Some(Window { utilization: Some(utilization), tokens: None, resets_at, eta_secs: None })
 }
 
 /// Short uppercase label for a scoped limit: the model display name ("Fable"),
@@ -275,7 +275,7 @@ fn parse_window(v: Option<&Value>) -> Option<Window> {
         .map(|d| d.with_timezone(&Utc));
     // A window with neither field is not worth showing.
     utilization?;
-    Some(Window { utilization, tokens: None, resets_at })
+    Some(Window { utilization, tokens: None, resets_at, eta_secs: None })
 }
 
 struct NewCreds {

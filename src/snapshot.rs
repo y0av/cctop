@@ -22,9 +22,14 @@ pub fn html(width: u16, height: u16, th: &Theme, multi: bool) -> String {
     };
     let mut state = TableState::default();
     state.select(Some(0)); // highlight the top (busy) agent
+    let detail = demo::detail(&agents[0]);
+    let n_sources = if multi { 3 } else { 1 };
 
     let mut term = Terminal::new(TestBackend::new(width, height)).expect("test backend");
-    term.draw(|f| ui::draw(f, th, &account, &agg, &agents, &plans, &mut state, "burn", 1)).expect("draw");
+    term.draw(|f| {
+        ui::draw(f, th, &account, &agg, &agents, &plans, Some(&detail), &mut state, "burn", n_sources)
+    })
+    .expect("draw");
     wrap(&buffer_to_pre(term.backend().buffer()))
 }
 

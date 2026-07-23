@@ -20,7 +20,10 @@ use chrono::Local;
 use clap::Parser;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::{Hide, Show};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -29,7 +32,7 @@ use ratatui::widgets::TableState;
 use ratatui::Terminal;
 
 use account::Account;
-use model::{PlanView, ScopedWindow, UsageSource, UsageWindows, Window};
+use model::{AgentDetail, PlanView, ScopedWindow, Tokens, UsageSource, UsageWindows, Window};
 use sessions::LiveAgent;
 use transcripts::{Aggregates, Store};
 
@@ -108,10 +111,73 @@ struct PlanSlot {
     live: Option<UsageWindows>,
     live_at: Option<Instant>,
     note: Option<String>,
+    /// Utilization samples per window ("5h" / "7d" / "wk:FABLE"…) feeding the
+    /// time-to-cap prediction. Trimmed to the trailing ~90 minutes.
+    rate: std::collections::HashMap<String, Vec<(Instant, f64)>>,
+}
+
+impl PlanSlot {
+    fn record_samples(&mut self, u: &UsageWindows) {
+        let now = Instant::now();
+        let mut put = |key: String, w: &Option<Window>| {
+            if let Some(util) = w.as_ref().and_then(|w| w.utilization) {
+                let v = self.rate.entry(key).or_default();
+                v.push((now, util));
+                v.retain(|(t, _)| now.duration_since(*t) < Duration::from_secs(5400));
+            }
+        };
+        put("5h".into(), &u.five_hour);
+        put("7d".into(), &u.seven_day);
+        for s in &u.scoped {
+            put(format!("wk:{}", s.label), &Some(s.win.clone()));
+        }
+    }
+
+    /// Linear time-to-100% from the recorded samples. Needs ≥5 minutes of
+    /// history and a visibly climbing window; anything flat returns None.
+    fn eta_secs(&self, key: &str, current: f64) -> Option<i64> {
+        let v = self.rate.get(key)?;
+        let (t_new, u_new) = *v.last()?;
+        let (t_old, u_old) =
+            *v.iter().find(|(t, _)| t_new.duration_since(*t) <= Duration::from_secs(2700))?;
+        let span = t_new.duration_since(t_old).as_secs_f64();
+        if span < 300.0 {
+            return None;
+        }
+        let rate = (u_new - u_old) / span; // percent per second
+        if rate <= 1e-5 {
+            return None; // < ~0.04%/h — effectively flat
+        }
+        Some((((100.0 - current) / rate) as i64).max(0))
+    }
+
+    /// Stamp cap-before-reset warnings onto a cloned live `UsageWindows`.
+    fn annotate_eta(&self, u: &mut UsageWindows) {
+        let mark = |slot: &Self, key: &str, w: &mut Option<Window>| {
+            let Some(w) = w.as_mut() else { return };
+            let (Some(util), Some(reset)) = (w.utilization, w.resets_at) else { return };
+            let to_reset = (reset.timestamp() - Local::now().timestamp()).max(0);
+            if let Some(eta) = slot.eta_secs(key, util) {
+                if eta < to_reset {
+                    w.eta_secs = Some(eta);
+                }
+            }
+        };
+        mark(self, "5h", &mut u.five_hour);
+        mark(self, "7d", &mut u.seven_day);
+        for s in &mut u.scoped {
+            let key = format!("wk:{}", s.label);
+            let mut w = Some(s.win.clone());
+            mark(self, &key, &mut w);
+            if let Some(w) = w {
+                s.win = w;
+            }
+        }
+    }
 }
 
 struct App {
-    sessions_dirs: Vec<PathBuf>,
+    sessions_dirs: Vec<(PathBuf, String)>,
     n_sources: usize,
     store: Store,
     account: Account,
@@ -122,6 +188,7 @@ struct App {
     table: TableState,
     sort: Sort,
     theme_idx: usize,
+    detail_on: bool,
     no_net: bool,
     demo: bool,
     tick: u64,
@@ -177,7 +244,11 @@ impl App {
                 let fresh =
                     s.live_at.map(|t| t.elapsed() < Duration::from_secs(180)).unwrap_or(false);
                 let usage = match (&s.live, fresh) {
-                    (Some(u), true) => u.clone(),
+                    (Some(u), true) => {
+                        let mut u = u.clone();
+                        s.annotate_eta(&mut u);
+                        u
+                    }
                     _ => {
                         let note = if self.no_net {
                             Some("network disabled (--no-net)".to_string())
@@ -209,6 +280,7 @@ impl App {
             match msg {
                 NetMsg::Live(i, u) => {
                     if let Some(s) = self.slots.get_mut(i) {
+                        s.record_samples(&u);
                         s.live = Some(u);
                         s.live_at = Some(Instant::now());
                         s.note = None;
@@ -227,6 +299,42 @@ impl App {
     /// (index, creds path) pairs for the poller / manual refresh.
     fn creds_paths(&self) -> Vec<(usize, PathBuf)> {
         self.slots.iter().enumerate().map(|(i, s)| (i, s.creds_path.clone())).collect()
+    }
+
+    /// Drill-down stats for the selected agent, joined from the transcript
+    /// store (session totals, cost, last-activity).
+    fn selected_detail(&self) -> Option<AgentDetail> {
+        let a = self.agents.get(self.table.selected()?)?;
+        if self.demo {
+            return Some(demo::detail(a));
+        }
+        let mut tok = Tokens::default();
+        let mut cost = 0.0;
+        for r in &self.store.records {
+            if r.session == a.session_id {
+                tok.add(&r.tok);
+                cost += r.cost;
+            }
+        }
+        let idle_secs = self
+            .store
+            .session_model
+            .get(&a.session_id)
+            .map(|(ts, _)| (Local::now().timestamp() - ts).max(0));
+        Some(AgentDetail {
+            project: a.project.clone(),
+            account: a.account.clone(),
+            model: a.model.clone(),
+            session_id: a.session_id.clone(),
+            cwd: a.cwd.clone(),
+            status: a.status.clone(),
+            uptime_secs: a.uptime_secs,
+            idle_secs,
+            tok,
+            cost,
+            burn_tps: a.burn_tps,
+            burn_hist: a.burn_hist.clone(),
+        })
     }
 
     fn select_next(&mut self) {
@@ -306,7 +414,14 @@ fn plan_slots(roots: &[PathBuf]) -> Vec<PlanSlot> {
         if !seen.insert(key) {
             continue;
         }
-        slots.push(PlanSlot { label, creds_path: creds, live: None, live_at: None, note: None });
+        slots.push(PlanSlot {
+            label,
+            creds_path: creds,
+            live: None,
+            live_at: None,
+            note: None,
+            rate: std::collections::HashMap::new(),
+        });
     }
     slots
 }
@@ -347,7 +462,8 @@ fn main() {
     // The base (first) dir owns the header identity; every dir with its own
     // credentials becomes a plan-gauge account of its own.
     let base = roots.first().cloned().unwrap_or_else(|| PathBuf::from(".claude"));
-    let sessions_dirs: Vec<PathBuf> = roots.iter().map(|d| d.join("sessions")).collect();
+    let sessions_dirs: Vec<(PathBuf, String)> =
+        roots.iter().map(|d| (d.join("sessions"), dir_label(d))).collect();
     let projects_roots: Vec<PathBuf> = roots.iter().map(|d| d.join("projects")).collect();
     let slots = plan_slots(&roots);
 
@@ -364,6 +480,7 @@ fn main() {
         table: TableState::default(),
         sort: Sort::Burn,
         theme_idx,
+        detail_on: true,
         no_net: args.no_net,
         demo: args.demo,
         tick: 0,
@@ -415,13 +532,13 @@ fn main() {
 
 fn run_tui(app: &mut App, rx: &mpsc::Receiver<NetMsg>, refresh_ms: u64) -> std::io::Result<()> {
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, Hide)?;
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
 
     // Restore the terminal even on panic.
     let orig = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |p| {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen, Show);
+        let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture, Show);
         orig(p);
     }));
 
@@ -434,49 +551,65 @@ fn run_tui(app: &mut App, rx: &mpsc::Receiver<NetMsg>, refresh_ms: u64) -> std::
         app.drain_net(rx);
         let sort_label = app.sort.label();
         let n_sources = app.n_sources;
+        let detail = if app.detail_on { app.selected_detail() } else { None };
         let th = &theme::THEMES[app.theme_idx];
         term.draw(|f| {
-            ui::draw(f, th, &app.account, &app.agg, &app.agents, &app.plans, &mut app.table, sort_label, n_sources)
+            ui::draw(f, th, &app.account, &app.agg, &app.agents, &app.plans, detail.as_ref(),
+                     &mut app.table, sort_label, n_sources)
         })?;
 
         let timeout = tick.saturating_sub(last.elapsed());
         if event::poll(timeout)? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
-                    match k.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            break Ok(())
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => app.select_next(),
-                        KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
-                        KeyCode::Char('s') => {
-                            app.sort = app.sort.next();
-                            apply_sort(&mut app.agents, app.sort);
-                        }
-                        KeyCode::Char('t') => {
-                            app.theme_idx = (app.theme_idx + 1) % theme::THEMES.len();
-                            theme::save(theme::THEMES[app.theme_idx].name);
-                        }
-                        KeyCode::Char('r') if !app.no_net => {
-                            let cps = app.creds_paths();
-                            let txc = app.tx.clone();
-                            std::thread::spawn(move || {
-                                for (i, cp) in &cps {
-                                    let now_ms = Local::now().timestamp_millis();
-                                    let msg = match account::ensure_and_fetch(cp, now_ms) {
-                                        Ok(u) => NetMsg::Live(*i, u),
-                                        Err(e) => NetMsg::Err(*i, e),
-                                    };
-                                    if txc.send(msg).is_err() {
-                                        return;
-                                    }
-                                }
-                            });
-                        }
-                        _ => {}
+            match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        break Ok(())
                     }
-                }
+                    KeyCode::Down | KeyCode::Char('j') => app.select_next(),
+                    KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
+                    KeyCode::Enter | KeyCode::Char('d') => app.detail_on = !app.detail_on,
+                    KeyCode::Char('s') => {
+                        app.sort = app.sort.next();
+                        apply_sort(&mut app.agents, app.sort);
+                    }
+                    KeyCode::Char('t') => {
+                        app.theme_idx = (app.theme_idx + 1) % theme::THEMES.len();
+                        theme::save(theme::THEMES[app.theme_idx].name);
+                    }
+                    KeyCode::Char('r') if !app.no_net => {
+                        let cps = app.creds_paths();
+                        let txc = app.tx.clone();
+                        std::thread::spawn(move || {
+                            for (i, cp) in &cps {
+                                let now_ms = Local::now().timestamp_millis();
+                                let msg = match account::ensure_and_fetch(cp, now_ms) {
+                                    Ok(u) => NetMsg::Live(*i, u),
+                                    Err(e) => NetMsg::Err(*i, e),
+                                };
+                                if txc.send(msg).is_err() {
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                    _ => {}
+                },
+                Event::Mouse(m) => match m.kind {
+                    MouseEventKind::ScrollDown => app.select_next(),
+                    MouseEventKind::ScrollUp => app.select_prev(),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let size = term.size()?;
+                        if let Some(i) = ui::agents_row_at(size, &app.plans, m.row) {
+                            let i = i + app.table.offset();
+                            if i < app.agents.len() {
+                                app.table.select(Some(i));
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
             }
         }
         if last.elapsed() >= tick {
@@ -486,7 +619,7 @@ fn run_tui(app: &mut App, rx: &mpsc::Receiver<NetMsg>, refresh_ms: u64) -> std::
     };
 
     disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen, Show)?;
+    execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture, Show)?;
     res
 }
 
@@ -510,6 +643,7 @@ fn estimate(agg: &Aggregates, note: Option<String>) -> UsageWindows {
         utilization: Some((tok as f64 / budget as f64 * 100.0).min(999.0)),
         tokens: Some(tok),
         resets_at: None,
+        eta_secs: None,
     };
     let scoped = agg
         .last7d_by_family
@@ -550,6 +684,7 @@ fn empty_aggregates() -> Aggregates {
         buckets24: vec![0; 24],
         last5h_tok: 0,
         last7d_tok: 0,
+        last7d_cost: 0.0,
         grand_tok: 0,
         grand_cost: 0.0,
     }

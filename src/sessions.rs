@@ -23,9 +23,11 @@ struct SessionFile {
 
 pub struct LiveAgent {
     pub pid: i32,
-    #[allow(dead_code)] // joined on during enrichment; kept for future drill-down
     pub session_id: String,
     pub project: String,
+    /// Which config dir (account env) this session belongs to.
+    pub account: String,
+    pub cwd: String,
     pub model: String,
     pub status: String, // "busy" | "idle" | ...
     pub uptime_secs: i64,
@@ -36,17 +38,17 @@ pub struct LiveAgent {
     pub kind: String,
 }
 
-/// Read all session files across every config dir, drop dead ones, and enrich
-/// the survivors.
-pub fn read(sessions_dirs: &[PathBuf], store: &Store, now_ms: i64) -> Vec<LiveAgent> {
+/// Read all session files across every config dir (each tagged with a short
+/// account label), drop dead ones, and enrich the survivors.
+pub fn read(sessions_dirs: &[(PathBuf, String)], store: &Store, now_ms: i64) -> Vec<LiveAgent> {
     let mut out = Vec::new();
 
     // Parse every session file (across all config dirs) first, then resolve
     // liveness/memory for all PIDs in one OS process-table query (cheaper than
     // one query per PID). PIDs are OS-global, so sessions from different config
     // dirs never collide.
-    let mut candidates: Vec<SessionFile> = Vec::new();
-    for dir in sessions_dirs {
+    let mut candidates: Vec<(SessionFile, usize)> = Vec::new();
+    for (di, (dir, _)) in sessions_dirs.iter().enumerate() {
         let rd = match std::fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(_) => continue,
@@ -56,17 +58,18 @@ pub fn read(sessions_dirs: &[PathBuf], store: &Store, now_ms: i64) -> Vec<LiveAg
                 .map(|e| e.path())
                 .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
                 .filter_map(|p| std::fs::read_to_string(&p).ok())
-                .filter_map(|txt| serde_json::from_str::<SessionFile>(&txt).ok()),
+                .filter_map(|txt| serde_json::from_str::<SessionFile>(&txt).ok())
+                .map(|sf| (sf, di)),
         );
     }
 
-    let pids: Vec<Pid> = candidates.iter().map(|c| Pid::from_u32(c.pid as u32)).collect();
+    let pids: Vec<Pid> = candidates.iter().map(|(c, _)| Pid::from_u32(c.pid as u32)).collect();
     let mut sys = System::new_with_specifics(
         RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_memory()),
     );
     sys.refresh_processes(ProcessesToUpdate::Some(&pids), true);
 
-    for sf in candidates {
+    for (sf, di) in candidates {
         let Some(rss_kb) = process_info(&sys, sf.pid) else {
             continue; // no such process — stale registry entry for a dead process
         };
@@ -92,6 +95,8 @@ pub fn read(sessions_dirs: &[PathBuf], store: &Store, now_ms: i64) -> Vec<LiveAg
             pid: sf.pid,
             session_id,
             project: transcripts::project_name(&cwd).to_string(),
+            account: sessions_dirs[di].1.clone(),
+            cwd,
             model,
             status: sf.status.unwrap_or_else(|| "?".to_string()),
             uptime_secs,

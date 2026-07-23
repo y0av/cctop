@@ -4,7 +4,7 @@
 use chrono::{Duration, Utc};
 
 use crate::account::Account;
-use crate::model::{PlanView, ScopedWindow, Spend, UsageSource, UsageWindows, Window};
+use crate::model::{AgentDetail, PlanView, ScopedWindow, Spend, Tokens, UsageSource, UsageWindows, Window};
 use crate::sessions::LiveAgent;
 use crate::transcripts::Aggregates;
 
@@ -24,9 +24,14 @@ pub fn usage() -> UsageWindows {
         utilization: Some(util),
         tokens: None,
         resets_at: Some(now + Duration::minutes(mins)),
+        eta_secs: None,
     };
+    // The 5-hour window carries a cap-before-reset warning to show off the
+    // burn-rate prediction.
+    let mut five_hour = mk(71.0, 102);
+    five_hour.eta_secs = Some(58 * 60);
     UsageWindows {
-        five_hour: Some(mk(71.0, 102)),
+        five_hour: Some(five_hour),
         seven_day: Some(mk(38.0, 4 * 1440 + 305)),
         scoped: vec![
             ScopedWindow { label: "FABLE".into(), win: mk(62.0, 4 * 1440 + 305) },
@@ -73,6 +78,8 @@ pub fn agents(tick: u64) -> Vec<LiveAgent> {
         pid,
         session_id: String::new(),
         project: project.into(),
+        account: "ada".into(),
+        cwd: format!("/home/ada/dev/{project}"),
         model: model.into(),
         status: status.into(),
         uptime_secs: up,
@@ -90,6 +97,31 @@ pub fn agents(tick: u64) -> Vec<LiveAgent> {
         a(44820, "infra-terraform", "claude-haiku-4-5", "idle", 13260, 388, 0.0, vec![1; 8]),
         a(43771, "docs-site", "claude-opus-4-8", "shell", 22320, 502, 0.0, vec![1; 8]),
     ]
+}
+
+/// Authored drill-down stats for a demo agent (no transcript store to join).
+pub fn detail(a: &LiveAgent) -> AgentDetail {
+    let busy = a.status == "busy";
+    AgentDetail {
+        project: a.project.clone(),
+        account: a.account.clone(),
+        model: a.model.clone(),
+        session_id: "3f2a9c1d-demo".into(),
+        cwd: a.cwd.clone(),
+        status: a.status.clone(),
+        uptime_secs: a.uptime_secs,
+        idle_secs: Some(if busy { 3 } else { 480 }),
+        tok: Tokens {
+            input: 84_000,
+            output: 61_000,
+            cache_read: 1_620_000,
+            cache_write_5m: 210_000,
+            cache_write_1h: 96_000,
+        },
+        cost: 12.41,
+        burn_tps: a.burn_tps,
+        burn_hist: a.burn_hist.clone(),
+    }
 }
 
 pub fn aggregates() -> Aggregates {
@@ -120,8 +152,9 @@ pub fn aggregates() -> Aggregates {
         today_tok: 3_400_000,
         today_cost: 42.18,
         buckets24,
-        last5h_tok: 0,
-        last7d_tok: 0,
+        last5h_tok: 2_100_000,
+        last7d_tok: 46_700_000,
+        last7d_cost: 297.60,
         grand_tok: 48_000_000,
         grand_cost: 312.40,
     }

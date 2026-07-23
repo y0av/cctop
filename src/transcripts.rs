@@ -212,6 +212,7 @@ impl Store {
         let mut today_cost = 0.0;
         let mut last5h = 0u64;
         let mut last7d = 0u64;
+        let mut last7d_cost = 0.0f64;
         let mut last7d_family: HashMap<&'static str, u64> = HashMap::new();
         let mut buckets24 = vec![0u64; 24];
 
@@ -247,6 +248,7 @@ impl Store {
             }
             if r.ts >= d7 {
                 last7d += r.tok.total();
+                last7d_cost += r.cost;
                 if let Some(fam) = family(&r.model) {
                     *last7d_family.entry(fam).or_default() += r.tok.total();
                 }
@@ -279,6 +281,7 @@ impl Store {
             buckets24,
             last5h_tok: last5h,
             last7d_tok: last7d,
+            last7d_cost,
             grand_tok: grand.total(),
             grand_cost,
         }
@@ -298,6 +301,7 @@ pub struct Aggregates {
     pub buckets24: Vec<u64>,
     pub last5h_tok: u64,
     pub last7d_tok: u64,
+    pub last7d_cost: f64,
     pub grand_tok: u64,
     pub grand_cost: f64,
 }

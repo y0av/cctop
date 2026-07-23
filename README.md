@@ -55,16 +55,19 @@ cctop
 ## What it shows
 
 - **Plan** — your live 5-hour and weekly limits (the same gauges as *claude.ai/settings/usage*) with reset timers, including the **per-model weekly caps** (Fable / Opus / Sonnet — whatever your plan enforces) and your **extra-usage credits** when overage is enabled. Falls back to a local estimate when offline.
-- **Live agents** — every running Claude Code session as a process row: project, model, busy/idle, uptime, memory, and a live token-burn sparkline.
-- **Usage** — today's tokens and cost, main-vs-subagent split, and lifetime breakdowns by model and project.
+- **▲cap prediction** — cctop tracks how fast each window is climbing; if your current burn rate would hit 100% *before* the reset, the gauge grows a red `▲cap 58m` warning so you can throttle down (or switch models) in time.
+- **Live agents** — every running Claude Code session as a process row: project, model, busy/idle, uptime, memory, and a live token-burn sparkline. Select a row (arrows, `j`/`k`, mouse wheel, or **click**) and the **drill-down panel** shows that session's totals: tokens in/out/cache, cost, last activity, working dir.
+- **Activity** — a 24-hour token column chart with today / 7-day / lifetime totals and cost, the main-vs-subagent split, and breakdowns by model and project.
 
 Token data is read locally from `~/.claude` (and any extra dirs you point it at — see [Multiple config dirs](#multiple-config-dirs)); the live plan gauges reuse your existing Claude Code OAuth login (Pro/Max). Nothing leaves your machine except the same usage request the CLI already makes.
 
 Works on Linux, macOS and Windows.
 
-## Keys
+## Keys & mouse
 
-`q` quit · `↑ ↓` select · `s` cycle sort · `t` cycle theme · `r` refresh
+`q` quit · `↑ ↓` select · `enter`/`d` toggle drill-down · `s` cycle sort · `t` cycle theme · `r` refresh
+
+The mouse works too: **click** an agent row to select it, **scroll** to move the selection.
 
 ## Themes
 
