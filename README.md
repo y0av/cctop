@@ -54,7 +54,7 @@ cctop
 
 ## What it shows
 
-- **Plan** — your live 5-hour and weekly limits (the same gauges as *claude.ai/settings/usage*) with reset timers. Falls back to a local estimate when offline.
+- **Plan** — your live 5-hour and weekly limits (the same gauges as *claude.ai/settings/usage*) with reset timers, including the **per-model weekly caps** (Fable / Opus / Sonnet — whatever your plan enforces) and your **extra-usage credits** when overage is enabled. Falls back to a local estimate when offline.
 - **Live agents** — every running Claude Code session as a process row: project, model, busy/idle, uptime, memory, and a live token-burn sparkline.
 - **Usage** — today's tokens and cost, main-vs-subagent split, and lifetime breakdowns by model and project.
 
@@ -64,7 +64,23 @@ Works on Linux, macOS and Windows.
 
 ## Keys
 
-`q` quit · `↑ ↓` select · `s` cycle sort · `r` refresh
+`q` quit · `↑ ↓` select · `s` cycle sort · `t` cycle theme · `r` refresh
+
+## Themes
+
+![themes](assets/themes.png)
+
+Press `t` to cycle themes live — the pick is remembered across runs (`~/.config/cctop/theme`) — or start with `--theme NAME`. Every theme restyles the whole UI: palette, border glyphs, gauge & bar characters.
+
+| theme | vibe |
+|-------|------|
+| `cyber` | neon green/cyan on black — the classic (default) |
+| `claude` | warm Anthropic terracotta, rounded corners |
+| `matrix` | green phosphor CRT |
+| `dracula` | the classic purple/pink dark palette |
+| `nord` | calm arctic frost, thin-line gauges |
+| `synthwave` | hot pink & cyan, double-line frames |
+| `mono` | grayscale ASCII brutalism |
 
 ## Flags
 
@@ -73,6 +89,7 @@ Works on Linux, macOS and Windows.
 | `--demo` | run with synthetic data — no account needed |
 | `--no-net` | local data only, never touch the network |
 | `--once` | print a one-shot text snapshot and exit |
+| `--theme NAME` | pick a theme (see [Themes](#themes)) |
 | `--config-dir DIR` | also read another Claude config dir (repeatable) — see [Multiple config dirs](#multiple-config-dirs) |
 
 ## Multiple config dirs
