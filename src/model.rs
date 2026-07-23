@@ -39,6 +39,23 @@ pub struct Window {
     pub resets_at: Option<DateTime<Utc>>,
 }
 
+/// A model-scoped weekly window (e.g. the Fable or Opus weekly cap), labeled
+/// with the short model name the API reports.
+#[derive(Clone)]
+pub struct ScopedWindow {
+    pub label: String,
+    pub win: Window,
+}
+
+/// Extra-usage spend (overage credits), shown only when the account has it
+/// enabled. Dollar amounts; `limit`/`percent` may be unknown.
+#[derive(Clone)]
+pub struct Spend {
+    pub used: f64,
+    pub limit: Option<f64>,
+    pub percent: Option<f64>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum UsageSource {
     Live,
@@ -50,8 +67,9 @@ pub enum UsageSource {
 pub struct UsageWindows {
     pub five_hour: Option<Window>,
     pub seven_day: Option<Window>,
-    pub seven_day_opus: Option<Window>,
-    pub seven_day_sonnet: Option<Window>,
+    /// Model-scoped weeklies (Fable / Opus / Sonnet / whatever the API sends).
+    pub scoped: Vec<ScopedWindow>,
+    pub spend: Option<Spend>,
     pub source: UsageSource,
     /// e.g. the network error that forced the estimate fallback.
     pub note: Option<String>,

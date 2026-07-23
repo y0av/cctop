@@ -3,8 +3,11 @@
 //! Endpoints confirmed from the Claude Code bundle:
 //!   GET  https://api.anthropic.com/api/oauth/usage   (Bearer + oauth beta header)
 //!   POST https://platform.claude.com/v1/oauth/token  (refresh_token grant)
-//! The usage response carries `five_hour` / `seven_day` / `seven_day_opus` /
-//! `seven_day_sonnet`, each `{utilization, resets_at}`.
+//! The response carries top-level `five_hour` / `seven_day` windows plus a
+//! `limits[]` array; model-scoped weekly caps (Fable, Opus, Sonnet, …) arrive
+//! as `{kind:"weekly_scoped", percent, resets_at, scope:{model:{display_name}}}`
+//! entries there. The older `seven_day_opus`/`seven_day_sonnet` fields still
+//! exist but are null on current accounts — kept as a parse fallback.
 
 use std::io::Write;
 #[cfg(unix)]
@@ -15,7 +18,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::model::{UsageSource, UsageWindows, Window};
+use crate::model::{ScopedWindow, Spend, UsageSource, UsageWindows, Window};
 
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -151,13 +154,111 @@ fn fetch_usage(access_token: &str) -> Result<UsageWindows, String> {
         return Err(format!("usage HTTP {}", status.as_u16()));
     }
     let v: Value = resp.json().map_err(|e| e.to_string())?;
-    Ok(UsageWindows {
-        five_hour: parse_window(v.get("five_hour")),
-        seven_day: parse_window(v.get("seven_day")),
-        seven_day_opus: parse_window(v.get("seven_day_opus")),
-        seven_day_sonnet: parse_window(v.get("seven_day_sonnet")),
+    Ok(parse_usage(&v))
+}
+
+fn parse_usage(v: &Value) -> UsageWindows {
+    let mut five_hour = parse_window(v.get("five_hour"));
+    let mut seven_day = parse_window(v.get("seven_day"));
+    let mut scoped: Vec<ScopedWindow> = Vec::new();
+
+    // Modern shape: the `limits` array. Scoped weeklies only exist here.
+    if let Some(limits) = v.get("limits").and_then(Value::as_array) {
+        for l in limits {
+            let win = window_from_limit(l);
+            match l.get("kind").and_then(Value::as_str).unwrap_or("") {
+                "session" => {
+                    if five_hour.is_none() {
+                        five_hour = win;
+                    }
+                }
+                "weekly_all" => {
+                    if seven_day.is_none() {
+                        seven_day = win;
+                    }
+                }
+                "weekly_scoped" => {
+                    if let Some(w) = win {
+                        scoped.push(ScopedWindow { label: scope_label(l), win: w });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Legacy shape: dedicated per-model weekly fields (null on new accounts).
+    if scoped.is_empty() {
+        for (label, key) in [("OPUS", "seven_day_opus"), ("SONNET", "seven_day_sonnet")] {
+            if let Some(w) = parse_window(v.get(key)) {
+                scoped.push(ScopedWindow { label: label.to_string(), win: w });
+            }
+        }
+    }
+
+    UsageWindows {
+        five_hour,
+        seven_day,
+        scoped,
+        spend: parse_spend(v),
         source: UsageSource::Live,
         note: None,
+    }
+}
+
+fn window_from_limit(l: &Value) -> Option<Window> {
+    let utilization = l.get("percent").and_then(Value::as_f64)?;
+    let resets_at = l
+        .get("resets_at")
+        .and_then(Value::as_str)
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc));
+    Some(Window { utilization: Some(utilization), tokens: None, resets_at })
+}
+
+/// Short uppercase label for a scoped limit: the model display name ("Fable"),
+/// else the surface, else the raw kind.
+fn scope_label(l: &Value) -> String {
+    let scope = l.get("scope");
+    let name = scope
+        .and_then(|s| s.get("model"))
+        .and_then(|m| m.get("display_name"))
+        .and_then(Value::as_str)
+        .or_else(|| scope.and_then(|s| s.get("surface")).and_then(Value::as_str))
+        .unwrap_or_else(|| l.get("kind").and_then(Value::as_str).unwrap_or("?"));
+    name.chars().take(6).collect::<String>().to_uppercase()
+}
+
+/// Overage spend, preferring the newer `spend` object over `extra_usage`.
+/// Returns None unless the account actually has extra usage enabled.
+fn parse_spend(v: &Value) -> Option<Spend> {
+    if let Some(s) = v.get("spend") {
+        if s.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
+            let money = |m: Option<&Value>| -> Option<f64> {
+                let m = m?;
+                if let Some(n) = m.as_f64() {
+                    return Some(n);
+                }
+                let minor = m.get("amount_minor").and_then(Value::as_f64)?;
+                let exp = m.get("exponent").and_then(Value::as_i64).unwrap_or(2);
+                Some(minor / 10f64.powi(exp as i32))
+            };
+            return Some(Spend {
+                used: money(s.get("used")).unwrap_or(0.0),
+                limit: money(s.get("limit")),
+                percent: s.get("percent").and_then(Value::as_f64),
+            });
+        }
+    }
+    let e = v.get("extra_usage")?;
+    if !e.get("is_enabled").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let scale = 10f64.powi(e.get("decimal_places").and_then(Value::as_i64).unwrap_or(2) as i32);
+    Some(Spend {
+        used: e.get("used_credits").and_then(Value::as_f64).unwrap_or(0.0) / scale,
+        limit: e.get("monthly_limit").and_then(Value::as_f64).map(|l| l / scale),
+        percent: e.get("utilization").and_then(Value::as_f64),
     })
 }
 

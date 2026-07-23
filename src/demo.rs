@@ -4,7 +4,7 @@
 use chrono::{Duration, Utc};
 
 use crate::account::Account;
-use crate::model::{UsageSource, UsageWindows, Window};
+use crate::model::{ScopedWindow, Spend, UsageSource, UsageWindows, Window};
 use crate::sessions::LiveAgent;
 use crate::transcripts::Aggregates;
 
@@ -20,14 +20,19 @@ pub fn account() -> Account {
 
 pub fn usage() -> UsageWindows {
     let now = Utc::now();
-    let mk = |util: f64, mins: i64| {
-        Some(Window { utilization: Some(util), tokens: None, resets_at: Some(now + Duration::minutes(mins)) })
+    let mk = |util: f64, mins: i64| Window {
+        utilization: Some(util),
+        tokens: None,
+        resets_at: Some(now + Duration::minutes(mins)),
     };
     UsageWindows {
-        five_hour: mk(71.0, 102),
-        seven_day: mk(38.0, 4 * 1440 + 305),
-        seven_day_opus: mk(52.0, 4 * 1440 + 305),
-        seven_day_sonnet: None,
+        five_hour: Some(mk(71.0, 102)),
+        seven_day: Some(mk(38.0, 4 * 1440 + 305)),
+        scoped: vec![
+            ScopedWindow { label: "FABLE".into(), win: mk(62.0, 4 * 1440 + 305) },
+            ScopedWindow { label: "OPUS".into(), win: mk(41.0, 4 * 1440 + 305) },
+        ],
+        spend: Some(Spend { used: 12.60, limit: Some(50.0), percent: Some(25.0) }),
         source: UsageSource::Live,
         note: None,
     }
@@ -51,7 +56,7 @@ pub fn agents(tick: u64) -> Vec<LiveAgent> {
         kind: "interactive".into(),
     };
     vec![
-        a(48213, "api-gateway", "claude-opus-4-8", "busy", 264, 345,
+        a(48213, "api-gateway", "claude-fable-5", "busy", 264, 345,
             78.0 + (tick % 7) as f64, roll(&[40, 58, 72, 61, 84, 76, 91, 80], tick)),
         a(47190, "web-frontend", "claude-sonnet-4-6", "busy", 743, 410,
             52.0 + (tick % 5) as f64, roll(&[30, 42, 38, 55, 48, 60, 52, 46], tick + 3)),
@@ -71,10 +76,12 @@ pub fn aggregates() -> Aggregates {
         .collect();
     Aggregates {
         by_model: vec![
-            ("claude-opus-4-8".into(), 37_400_000, 268.40),
+            ("claude-opus-4-8".into(), 24_800_000, 178.20),
+            ("claude-fable-5".into(), 12_600_000, 90.20),
             ("claude-sonnet-4-6".into(), 8_600_000, 38.10),
             ("claude-haiku-4-5".into(), 2_000_000, 5.90),
         ],
+        last7d_by_family: vec![("OPUS", 24_800_000), ("FABLE", 12_600_000), ("SONNET", 8_600_000)],
         by_project: vec![
             ("web-frontend".into(), 19_600_000, 128.0),
             ("data-pipeline".into(), 12_900_000, 84.0),

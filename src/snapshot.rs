@@ -7,9 +7,10 @@ use ratatui::style::{Color, Modifier};
 use ratatui::widgets::TableState;
 use ratatui::Terminal;
 
+use crate::theme::Theme;
 use crate::{demo, ui};
 
-pub fn html(width: u16, height: u16) -> String {
+pub fn html(width: u16, height: u16, th: &Theme) -> String {
     let account = demo::account();
     let agg = demo::aggregates();
     let agents = demo::agents(0);
@@ -18,7 +19,7 @@ pub fn html(width: u16, height: u16) -> String {
     state.select(Some(0)); // highlight the top (busy) agent
 
     let mut term = Terminal::new(TestBackend::new(width, height)).expect("test backend");
-    term.draw(|f| ui::draw(f, &account, &agg, &agents, &usage, &mut state, "burn", 1)).expect("draw");
+    term.draw(|f| ui::draw(f, th, &account, &agg, &agents, &usage, &mut state, "burn", 1)).expect("draw");
     wrap(&buffer_to_pre(term.backend().buffer()))
 }
 

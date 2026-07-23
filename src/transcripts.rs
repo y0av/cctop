@@ -212,6 +212,7 @@ impl Store {
         let mut today_cost = 0.0;
         let mut last5h = 0u64;
         let mut last7d = 0u64;
+        let mut last7d_family: HashMap<&'static str, u64> = HashMap::new();
         let mut buckets24 = vec![0u64; 24];
 
         let h5 = now - 5 * 3600;
@@ -246,6 +247,9 @@ impl Store {
             }
             if r.ts >= d7 {
                 last7d += r.tok.total();
+                if let Some(fam) = family(&r.model) {
+                    *last7d_family.entry(fam).or_default() += r.tok.total();
+                }
             }
             if r.ts >= day {
                 let idx = ((r.ts - day) / 3600).clamp(0, 23) as usize;
@@ -261,9 +265,13 @@ impl Store {
             by_project.into_iter().map(|(k, v)| (k.to_string(), v.0.total(), v.1)).collect();
         by_project.sort_by(|a, b| b.1.cmp(&a.1));
 
+        let mut last7d_by_family: Vec<(&'static str, u64)> = last7d_family.into_iter().collect();
+        last7d_by_family.sort_by(|a, b| b.1.cmp(&a.1));
+
         Aggregates {
             by_model,
             by_project,
+            last7d_by_family,
             main_tok: main.total(),
             agent_tok: agents.total(),
             today_tok,
@@ -280,6 +288,9 @@ impl Store {
 pub struct Aggregates {
     pub by_model: Vec<(String, u64, f64)>,
     pub by_project: Vec<(String, u64, f64)>,
+    /// Trailing-7-day tokens per model family — the offline stand-in for the
+    /// API's model-scoped weekly windows.
+    pub last7d_by_family: Vec<(&'static str, u64)>,
     pub main_tok: u64,
     pub agent_tok: u64,
     pub today_tok: u64,
@@ -289,6 +300,22 @@ pub struct Aggregates {
     pub last7d_tok: u64,
     pub grand_tok: u64,
     pub grand_cost: f64,
+}
+
+/// Model family label for the scoped-weekly estimate rows.
+fn family(model: &str) -> Option<&'static str> {
+    let m = model.to_ascii_lowercase();
+    if m.contains("fable") || m.contains("mythos") {
+        Some("FABLE")
+    } else if m.contains("opus") {
+        Some("OPUS")
+    } else if m.contains("sonnet") {
+        Some("SONNET")
+    } else if m.contains("haiku") {
+        Some("HAIKU")
+    } else {
+        None
+    }
 }
 
 /// Last path component of a cwd, for compact display.

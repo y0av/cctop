@@ -29,7 +29,7 @@ use ratatui::widgets::TableState;
 use ratatui::Terminal;
 
 use account::Account;
-use model::{UsageSource, UsageWindows, Window};
+use model::{ScopedWindow, UsageSource, UsageWindows, Window};
 use sessions::LiveAgent;
 use transcripts::{Aggregates, Store};
 
@@ -50,9 +50,10 @@ struct Args {
     /// Print one plain-text snapshot and exit (no TTY required).
     #[arg(long)]
     once: bool,
-    /// Color theme (only "cyber" is implemented).
-    #[arg(long, default_value = "cyber")]
-    theme: String,
+    /// Theme: cyber, claude, matrix, dracula, nord, synthwave, mono.
+    /// Defaults to the last one picked with the `t` key (or cyber).
+    #[arg(long)]
+    theme: Option<String>,
     /// Render with synthetic demo data (no account access).
     #[arg(long)]
     demo: bool,
@@ -109,6 +110,7 @@ struct App {
     net_note: Option<String>,
     table: TableState,
     sort: Sort,
+    theme_idx: usize,
     no_net: bool,
     demo: bool,
     tick: u64,
@@ -229,8 +231,18 @@ fn config_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
 fn main() {
     let args = Args::parse();
 
+    // Theme precedence: --theme flag > choice saved by the `t` key > default.
+    let theme_idx = match &args.theme {
+        Some(name) => theme::index_of(name).unwrap_or_else(|| {
+            eprintln!("cctop: unknown theme '{name}' — available: {}", theme::names().join(", "));
+            std::process::exit(2);
+        }),
+        None => theme::load_saved().unwrap_or(0),
+    };
+
     if let Some(path) = &args.snapshot {
-        std::fs::write(path, snapshot::html(100, 26)).expect("write snapshot html");
+        std::fs::write(path, snapshot::html(100, 27, &theme::THEMES[theme_idx]))
+            .expect("write snapshot html");
         return;
     }
 
@@ -258,6 +270,7 @@ fn main() {
         net_note: None,
         table: TableState::default(),
         sort: Sort::Burn,
+        theme_idx,
         no_net: args.no_net,
         demo: args.demo,
         tick: 0,
@@ -324,8 +337,9 @@ fn run_tui(app: &mut App, rx: &mpsc::Receiver<NetMsg>, refresh_ms: u64) -> std::
         app.drain_net(rx);
         let sort_label = app.sort.label();
         let n_sources = app.n_sources;
+        let th = &theme::THEMES[app.theme_idx];
         term.draw(|f| {
-            ui::draw(f, &app.account, &app.agg, &app.agents, &app.usage, &mut app.table, sort_label, n_sources)
+            ui::draw(f, th, &app.account, &app.agg, &app.agents, &app.usage, &mut app.table, sort_label, n_sources)
         })?;
 
         let timeout = tick.saturating_sub(last.elapsed());
@@ -342,6 +356,10 @@ fn run_tui(app: &mut App, rx: &mpsc::Receiver<NetMsg>, refresh_ms: u64) -> std::
                         KeyCode::Char('s') => {
                             app.sort = app.sort.next();
                             apply_sort(&mut app.agents, app.sort);
+                        }
+                        KeyCode::Char('t') => {
+                            app.theme_idx = (app.theme_idx + 1) % theme::THEMES.len();
+                            theme::save(theme::THEMES[app.theme_idx].name);
                         }
                         KeyCode::Char('r') if !app.no_net => {
                             let cp = app.creds_path.clone();
@@ -386,18 +404,21 @@ fn apply_sort(agents: &mut [LiveAgent], sort: Sort) {
 }
 
 fn estimate(agg: &Aggregates, note: Option<String>) -> UsageWindows {
-    let mk = |tok: u64, budget: u64| {
-        Some(Window {
-            utilization: Some((tok as f64 / budget as f64 * 100.0).min(999.0)),
-            tokens: Some(tok),
-            resets_at: None,
-        })
+    let mk = |tok: u64, budget: u64| Window {
+        utilization: Some((tok as f64 / budget as f64 * 100.0).min(999.0)),
+        tokens: Some(tok),
+        resets_at: None,
     };
+    let scoped = agg
+        .last7d_by_family
+        .iter()
+        .map(|(fam, tok)| ScopedWindow { label: fam.to_string(), win: mk(*tok, EST_7D_BUDGET) })
+        .collect();
     UsageWindows {
-        five_hour: mk(agg.last5h_tok, EST_5H_BUDGET),
-        seven_day: mk(agg.last7d_tok, EST_7D_BUDGET),
-        seven_day_opus: None,
-        seven_day_sonnet: None,
+        five_hour: Some(mk(agg.last5h_tok, EST_5H_BUDGET)),
+        seven_day: Some(mk(agg.last7d_tok, EST_7D_BUDGET)),
+        scoped,
+        spend: None,
         source: UsageSource::Estimate,
         note,
     }
@@ -419,6 +440,7 @@ fn empty_aggregates() -> Aggregates {
     Aggregates {
         by_model: Vec::new(),
         by_project: Vec::new(),
+        last7d_by_family: Vec::new(),
         main_tok: 0,
         agent_tok: 0,
         today_tok: 0,
@@ -444,9 +466,15 @@ fn print_once(app: &App) {
     );
     print_window("  5-HOUR ", &app.usage.five_hour);
     print_window("  WEEKLY ", &app.usage.seven_day);
-    for (label, w) in [("  WK·OPUS", &app.usage.seven_day_opus), ("  WK·SONN", &app.usage.seven_day_sonnet)] {
-        if w.as_ref().and_then(|w| w.utilization).unwrap_or(0.0) > 0.0 {
-            print_window(label, w);
+    for s in &app.usage.scoped {
+        if s.win.utilization.unwrap_or(0.0) > 0.0 {
+            print_window(&format!("  WK·{}", s.label), &Some(s.win.clone()));
+        }
+    }
+    if let Some(sp) = &app.usage.spend {
+        match sp.limit {
+            Some(l) => println!("  EXTRA $ {:.2} / {:.0}", sp.used, l),
+            None => println!("  EXTRA $ {:.2}", sp.used),
         }
     }
     if let Some(n) = &app.usage.note {
