@@ -7,19 +7,24 @@ use ratatui::style::{Color, Modifier};
 use ratatui::widgets::TableState;
 use ratatui::Terminal;
 
+use crate::model::PlanView;
 use crate::theme::Theme;
 use crate::{demo, ui};
 
-pub fn html(width: u16, height: u16, th: &Theme) -> String {
+pub fn html(width: u16, height: u16, th: &Theme, multi: bool) -> String {
     let account = demo::account();
     let agg = demo::aggregates();
     let agents = demo::agents(0);
-    let usage = demo::usage();
+    let plans = if multi {
+        demo::multi_plans()
+    } else {
+        vec![PlanView { label: String::new(), usage: demo::usage() }]
+    };
     let mut state = TableState::default();
     state.select(Some(0)); // highlight the top (busy) agent
 
     let mut term = Terminal::new(TestBackend::new(width, height)).expect("test backend");
-    term.draw(|f| ui::draw(f, th, &account, &agg, &agents, &usage, &mut state, "burn", 1)).expect("draw");
+    term.draw(|f| ui::draw(f, th, &account, &agg, &agents, &plans, &mut state, "burn", 1)).expect("draw");
     wrap(&buffer_to_pre(term.backend().buffer()))
 }
 

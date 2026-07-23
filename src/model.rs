@@ -62,6 +62,15 @@ pub enum UsageSource {
     Estimate,
 }
 
+/// One account's plan gauges, ready for display. `label` is empty in
+/// single-account mode — the common case, where the panel title alone carries
+/// the state and the layout stays identical to a one-account cctop.
+#[derive(Clone)]
+pub struct PlanView {
+    pub label: String,
+    pub usage: UsageWindows,
+}
+
 /// The full set of plan gauges shown in the header block.
 #[derive(Clone)]
 pub struct UsageWindows {

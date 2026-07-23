@@ -12,7 +12,7 @@ mod ui;
 
 use std::cmp::Ordering;
 use std::io::stdout;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,7 @@ use ratatui::widgets::TableState;
 use ratatui::Terminal;
 
 use account::Account;
-use model::{ScopedWindow, UsageSource, UsageWindows, Window};
+use model::{PlanView, ScopedWindow, UsageSource, UsageWindows, Window};
 use sessions::LiveAgent;
 use transcripts::{Aggregates, Store};
 
@@ -60,6 +60,9 @@ struct Args {
     /// Write an HTML screenshot of the demo frame to FILE and exit.
     #[arg(long, value_name = "FILE")]
     snapshot: Option<PathBuf>,
+    /// With --snapshot: render the multi-account demo frame instead.
+    #[arg(long, hide = true)]
+    snapshot_multi: bool,
     /// Extra Claude config dir to also read (repeatable). Pass the dir that
     /// holds `projects/` and `sessions/` — e.g. a CLAUDE_CONFIG_DIR sandbox.
     /// Also settable via the CCTOP_CONFIG_DIRS path-list env var.
@@ -92,22 +95,30 @@ impl Sort {
 }
 
 enum NetMsg {
-    Live(UsageWindows),
-    Err(String),
+    Live(usize, UsageWindows),
+    Err(usize, String),
+}
+
+/// One account whose plan gauges we poll: a config dir with its own
+/// `.credentials.json`. The base dir is always a slot (creds or not, so the
+/// single-account estimate fallback still appears).
+struct PlanSlot {
+    label: String,
+    creds_path: PathBuf,
+    live: Option<UsageWindows>,
+    live_at: Option<Instant>,
+    note: Option<String>,
 }
 
 struct App {
     sessions_dirs: Vec<PathBuf>,
     n_sources: usize,
-    creds_path: PathBuf,
     store: Store,
     account: Account,
     agg: Aggregates,
     agents: Vec<LiveAgent>,
-    usage: UsageWindows,
-    live_usage: Option<UsageWindows>,
-    live_at: Option<Instant>,
-    net_note: Option<String>,
+    slots: Vec<PlanSlot>,
+    plans: Vec<PlanView>,
     table: TableState,
     sort: Sort,
     theme_idx: usize,
@@ -128,8 +139,8 @@ impl App {
                 self.table.select(Some(0));
             }
             self.agents = agents;
-            self.usage = demo::usage();
             self.tick = self.tick.wrapping_add(1);
+            self.recompute_usage();
             return;
         }
         self.store.refresh();
@@ -147,39 +158,75 @@ impl App {
         self.recompute_usage();
     }
 
+    /// Rebuild the per-account plan views from slot state. Single-account keeps
+    /// the historical behavior (live → local-estimate fallback); with several
+    /// accounts, each not-yet-fetched one shows a pending row instead of a
+    /// misleading merged estimate.
     fn recompute_usage(&mut self) {
         // Demo gauges are authored, not derived — never replace them with the
         // estimate (or a live fetch would leak real account data into --demo).
         if self.demo {
-            self.usage = demo::usage();
+            self.plans = vec![PlanView { label: String::new(), usage: demo::usage() }];
             return;
         }
-        let fresh = self.live_at.map(|t| t.elapsed() < Duration::from_secs(180)).unwrap_or(false);
-        self.usage = match (&self.live_usage, fresh) {
-            (Some(u), true) => u.clone(),
-            _ => {
-                let note = if self.no_net {
-                    Some("network disabled (--no-net)".to_string())
-                } else {
-                    self.net_note.clone().or_else(|| Some("awaiting live data…".to_string()))
+        let single = self.slots.len() == 1;
+        let plans: Vec<PlanView> = self
+            .slots
+            .iter()
+            .map(|s| {
+                let fresh =
+                    s.live_at.map(|t| t.elapsed() < Duration::from_secs(180)).unwrap_or(false);
+                let usage = match (&s.live, fresh) {
+                    (Some(u), true) => u.clone(),
+                    _ => {
+                        let note = if self.no_net {
+                            Some("network disabled (--no-net)".to_string())
+                        } else {
+                            s.note.clone().or_else(|| Some("awaiting live data…".to_string()))
+                        };
+                        if single {
+                            estimate(&self.agg, note)
+                        } else {
+                            UsageWindows {
+                                five_hour: None,
+                                seven_day: None,
+                                scoped: Vec::new(),
+                                spend: None,
+                                source: UsageSource::Estimate,
+                                note,
+                            }
+                        }
+                    }
                 };
-                estimate(&self.agg, note)
-            }
-        };
+                PlanView { label: if single { String::new() } else { s.label.clone() }, usage }
+            })
+            .collect();
+        self.plans = plans;
     }
 
     fn drain_net(&mut self, rx: &mpsc::Receiver<NetMsg>) {
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                NetMsg::Live(u) => {
-                    self.live_usage = Some(u);
-                    self.live_at = Some(Instant::now());
-                    self.net_note = None;
+                NetMsg::Live(i, u) => {
+                    if let Some(s) = self.slots.get_mut(i) {
+                        s.live = Some(u);
+                        s.live_at = Some(Instant::now());
+                        s.note = None;
+                    }
                 }
-                NetMsg::Err(e) => self.net_note = Some(e),
+                NetMsg::Err(i, e) => {
+                    if let Some(s) = self.slots.get_mut(i) {
+                        s.note = Some(e);
+                    }
+                }
             }
         }
         self.recompute_usage();
+    }
+
+    /// (index, creds path) pairs for the poller / manual refresh.
+    fn creds_paths(&self) -> Vec<(usize, PathBuf)> {
+        self.slots.iter().enumerate().map(|(i, s)| (i, s.creds_path.clone())).collect()
     }
 
     fn select_next(&mut self) {
@@ -234,6 +281,48 @@ fn config_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Build the plan-gauge accounts: the base dir always (so the single-account
+/// estimate fallback still appears without creds), plus every extra dir that
+/// carries its own `.credentials.json`. The same login mounted through two
+/// dirs collapses to one slot. With one config dir this is exactly one slot —
+/// the default single-account layout is untouched.
+fn plan_slots(roots: &[PathBuf]) -> Vec<PlanSlot> {
+    let mut slots = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (i, root) in roots.iter().enumerate() {
+        let creds = root.join(".credentials.json");
+        if i > 0 && !creds.exists() {
+            continue;
+        }
+        let acc = account::read_account(root);
+        let label = if !acc.display_name.is_empty() {
+            acc.display_name.clone()
+        } else if !acc.email.is_empty() {
+            acc.email.split('@').next().unwrap_or(&acc.email).to_string()
+        } else {
+            dir_label(root)
+        };
+        let key = if acc.email.is_empty() { root.display().to_string() } else { acc.email.clone() };
+        if !seen.insert(key) {
+            continue;
+        }
+        slots.push(PlanSlot { label, creds_path: creds, live: None, live_at: None, note: None });
+    }
+    slots
+}
+
+/// Compact human name for a config dir: the last path component, except that a
+/// generic ".claude"/"claude" leaf defers to its parent (e.g. envs/bobo/claude
+/// → "bobo").
+fn dir_label(root: &Path) -> String {
+    let mut comps = root.iter().rev().filter_map(|c| c.to_str());
+    match comps.next() {
+        Some(".claude") | Some("claude") => comps.next().unwrap_or("claude").to_string(),
+        Some(other) => other.to_string(),
+        None => "?".to_string(),
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -247,33 +336,31 @@ fn main() {
     };
 
     if let Some(path) = &args.snapshot {
-        std::fs::write(path, snapshot::html(100, 27, &theme::THEMES[theme_idx]))
+        let height = if args.snapshot_multi { 31 } else { 27 };
+        std::fs::write(path, snapshot::html(100, height, &theme::THEMES[theme_idx], args.snapshot_multi))
             .expect("write snapshot html");
         return;
     }
 
     let roots = config_dirs(&args.config_dir);
     let n_sources = roots.len();
-    // The base (first) dir owns the account identity + live plan gauges; extra
-    // dirs only contribute transcripts and live agents.
+    // The base (first) dir owns the header identity; every dir with its own
+    // credentials becomes a plan-gauge account of its own.
     let base = roots.first().cloned().unwrap_or_else(|| PathBuf::from(".claude"));
-    let creds_path = base.join(".credentials.json");
     let sessions_dirs: Vec<PathBuf> = roots.iter().map(|d| d.join("sessions")).collect();
     let projects_roots: Vec<PathBuf> = roots.iter().map(|d| d.join("projects")).collect();
+    let slots = plan_slots(&roots);
 
     let (tx, rx) = mpsc::channel();
     let mut app = App {
         sessions_dirs,
         n_sources,
-        creds_path: creds_path.clone(),
         store: Store::new(projects_roots),
         account: account::read_account(&base),
         agg: empty_aggregates(),
         agents: Vec::new(),
-        usage: estimate(&empty_aggregates(), Some("starting…".to_string())),
-        live_usage: None,
-        live_at: None,
-        net_note: None,
+        slots,
+        plans: Vec::new(),
         table: TableState::default(),
         sort: Sort::Burn,
         theme_idx,
@@ -287,12 +374,14 @@ fn main() {
     if args.once {
         if !args.no_net && !args.demo {
             let now_ms = Local::now().timestamp_millis();
-            match account::ensure_and_fetch(&creds_path, now_ms) {
-                Ok(u) => {
-                    app.live_usage = Some(u);
-                    app.live_at = Some(Instant::now());
+            for i in 0..app.slots.len() {
+                match account::ensure_and_fetch(&app.slots[i].creds_path, now_ms) {
+                    Ok(u) => {
+                        app.slots[i].live = Some(u);
+                        app.slots[i].live_at = Some(Instant::now());
+                    }
+                    Err(e) => app.slots[i].note = Some(e),
                 }
-                Err(e) => app.net_note = Some(e),
             }
             app.recompute_usage();
         }
@@ -300,18 +389,20 @@ fn main() {
         return;
     }
 
-    // Background poller for live plan usage.
+    // Background poller for live plan usage — one thread walks every account.
     if !args.no_net && !args.demo {
-        let cp = creds_path.clone();
+        let cps = app.creds_paths();
         let txc = tx.clone();
         std::thread::spawn(move || loop {
-            let now_ms = Local::now().timestamp_millis();
-            let msg = match account::ensure_and_fetch(&cp, now_ms) {
-                Ok(u) => NetMsg::Live(u),
-                Err(e) => NetMsg::Err(e),
-            };
-            if txc.send(msg).is_err() {
-                break;
+            for (i, cp) in &cps {
+                let now_ms = Local::now().timestamp_millis();
+                let msg = match account::ensure_and_fetch(cp, now_ms) {
+                    Ok(u) => NetMsg::Live(*i, u),
+                    Err(e) => NetMsg::Err(*i, e),
+                };
+                if txc.send(msg).is_err() {
+                    return;
+                }
             }
             std::thread::sleep(Duration::from_secs(60));
         });
@@ -345,7 +436,7 @@ fn run_tui(app: &mut App, rx: &mpsc::Receiver<NetMsg>, refresh_ms: u64) -> std::
         let n_sources = app.n_sources;
         let th = &theme::THEMES[app.theme_idx];
         term.draw(|f| {
-            ui::draw(f, th, &app.account, &app.agg, &app.agents, &app.usage, &mut app.table, sort_label, n_sources)
+            ui::draw(f, th, &app.account, &app.agg, &app.agents, &app.plans, &mut app.table, sort_label, n_sources)
         })?;
 
         let timeout = tick.saturating_sub(last.elapsed());
@@ -368,14 +459,19 @@ fn run_tui(app: &mut App, rx: &mpsc::Receiver<NetMsg>, refresh_ms: u64) -> std::
                             theme::save(theme::THEMES[app.theme_idx].name);
                         }
                         KeyCode::Char('r') if !app.no_net => {
-                            let cp = app.creds_path.clone();
+                            let cps = app.creds_paths();
                             let txc = app.tx.clone();
                             std::thread::spawn(move || {
-                                let now_ms = Local::now().timestamp_millis();
-                                let _ = txc.send(match account::ensure_and_fetch(&cp, now_ms) {
-                                    Ok(u) => NetMsg::Live(u),
-                                    Err(e) => NetMsg::Err(e),
-                                });
+                                for (i, cp) in &cps {
+                                    let now_ms = Local::now().timestamp_millis();
+                                    let msg = match account::ensure_and_fetch(cp, now_ms) {
+                                        Ok(u) => NetMsg::Live(*i, u),
+                                        Err(e) => NetMsg::Err(*i, e),
+                                    };
+                                    if txc.send(msg).is_err() {
+                                        return;
+                                    }
+                                }
                             });
                         }
                         _ => {}
@@ -465,26 +561,30 @@ fn print_once(app: &App) {
     if !a.display_name.is_empty() || !a.org.is_empty() {
         println!("  {} · {}", a.display_name, a.org);
     }
-    println!();
-    println!(
-        "PLAN  [{}]",
-        if app.usage.source == UsageSource::Live { "live" } else { "local estimate" }
-    );
-    print_window("  5-HOUR ", &app.usage.five_hour);
-    print_window("  WEEKLY ", &app.usage.seven_day);
-    for s in &app.usage.scoped {
-        if s.win.utilization.unwrap_or(0.0) > 0.0 {
-            print_window(&format!("  WK·{}", s.label), &Some(s.win.clone()));
+    for p in &app.plans {
+        println!();
+        let src = if p.usage.source == UsageSource::Live { "live" } else { "local estimate" };
+        if p.label.is_empty() {
+            println!("PLAN  [{src}]");
+        } else {
+            println!("PLAN  {}  [{src}]", p.label);
         }
-    }
-    if let Some(sp) = &app.usage.spend {
-        match sp.limit {
-            Some(l) => println!("  EXTRA $ {:.2} / {:.0}", sp.used, l),
-            None => println!("  EXTRA $ {:.2}", sp.used),
+        print_window("  5-HOUR ", &p.usage.five_hour);
+        print_window("  WEEKLY ", &p.usage.seven_day);
+        for s in &p.usage.scoped {
+            if s.win.utilization.unwrap_or(0.0) > 0.0 {
+                print_window(&format!("  WK·{}", s.label), &Some(s.win.clone()));
+            }
         }
-    }
-    if let Some(n) = &app.usage.note {
-        println!("  note: {n}");
+        if let Some(sp) = &p.usage.spend {
+            match sp.limit {
+                Some(l) => println!("  EXTRA $ {:.2} / {:.0}", sp.used, l),
+                None => println!("  EXTRA $ {:.2}", sp.used),
+            }
+        }
+        if let Some(n) = &p.usage.note {
+            println!("  note: {n}");
+        }
     }
 
     println!();

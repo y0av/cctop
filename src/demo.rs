@@ -4,7 +4,7 @@
 use chrono::{Duration, Utc};
 
 use crate::account::Account;
-use crate::model::{ScopedWindow, Spend, UsageSource, UsageWindows, Window};
+use crate::model::{PlanView, ScopedWindow, Spend, UsageSource, UsageWindows, Window};
 use crate::sessions::LiveAgent;
 use crate::transcripts::Aggregates;
 
@@ -36,6 +36,32 @@ pub fn usage() -> UsageWindows {
         source: UsageSource::Live,
         note: None,
     }
+}
+
+/// Three synthetic accounts for the multi-account README shot: one healthy,
+/// one nearly capped, one still waiting on its first fetch.
+pub fn multi_plans() -> Vec<PlanView> {
+    let mut capped = usage();
+    if let Some(w) = capped.seven_day.as_mut() {
+        w.utilization = Some(96.0);
+    }
+    if let Some(s) = capped.scoped.first_mut() {
+        s.win.utilization = Some(100.0);
+    }
+    capped.spend = None;
+    let pending = UsageWindows {
+        five_hour: None,
+        seven_day: None,
+        scoped: Vec::new(),
+        spend: None,
+        source: UsageSource::Estimate,
+        note: Some("awaiting live data…".into()),
+    };
+    vec![
+        PlanView { label: "ada".into(), usage: usage() },
+        PlanView { label: "grace".into(), usage: capped },
+        PlanView { label: "lin".into(), usage: pending },
+    ]
 }
 
 pub fn agents(tick: u64) -> Vec<LiveAgent> {

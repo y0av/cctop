@@ -9,21 +9,18 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 
 use crate::account::Account;
-use crate::model::{Spend, UsageSource, UsageWindows, Window};
+use crate::model::{PlanView, Spend, UsageSource, UsageWindows, Window};
 use crate::sessions::LiveAgent;
 use crate::theme::Theme;
 use crate::theme;
 use crate::transcripts::Aggregates;
 
 pub fn draw(f: &mut Frame, th: &Theme, account: &Account, agg: &Aggregates, agents: &[LiveAgent],
-            usage: &UsageWindows, state: &mut TableState, sort_label: &str, n_sources: usize) {
-    // The plan panel grows with the number of scoped weeklies / spend / note.
-    let scoped_n = usage.scoped.iter().filter(|s| shown(&s.win)).count() as u16;
-    let gauge_h = (4
-        + scoped_n
-        + usage.spend.is_some() as u16
-        + usage.note.is_some() as u16)
-        .clamp(6, 12);
+            plans: &[PlanView], state: &mut TableState, sort_label: &str, n_sources: usize) {
+    // The plan panel grows with accounts / scoped weeklies / spend / note.
+    let multi = plans.len() > 1;
+    let lines: u16 = plans.iter().map(|p| plan_lines(&p.usage, multi)).sum();
+    let gauge_h = (2 + lines).clamp(6, 18);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -37,14 +34,24 @@ pub fn draw(f: &mut Frame, th: &Theme, account: &Account, agg: &Aggregates, agen
         .split(f.area());
 
     header(f, th, chunks[0], account);
-    gauges(f, th, chunks[1], usage);
+    gauges(f, th, chunks[1], plans);
     agents_table(f, th, chunks[2], agents, state);
     bottom(f, th, chunks[3], agg);
-    footer(f, th, chunks[4], usage, n_sources, sort_label);
+    footer(f, th, chunks[4], plans, n_sources, sort_label);
 }
 
 fn shown(w: &Window) -> bool {
     w.utilization.unwrap_or(0.0) > 0.0
+}
+
+/// Rendered line count for one account's gauges. In multi-account mode each
+/// account gets a header row and its note moves inline (into that row).
+fn plan_lines(u: &UsageWindows, multi: bool) -> u16 {
+    let n = u.five_hour.is_some() as u16
+        + u.seven_day.is_some() as u16
+        + u.scoped.iter().filter(|s| shown(&s.win)).count() as u16
+        + u.spend.is_some() as u16;
+    if multi { n + 1 } else { n + u.note.is_some() as u16 }
 }
 
 fn panel<'a>(th: &Theme, title: Line<'a>) -> Block<'a> {
@@ -104,9 +111,14 @@ fn tier_label(sub: &str, tier: &str) -> String {
     }
 }
 
-fn gauges(f: &mut Frame, th: &Theme, area: Rect, usage: &UsageWindows) {
-    let est = usage.source == UsageSource::Estimate;
-    let title = if est {
+fn gauges(f: &mut Frame, th: &Theme, area: Rect, plans: &[PlanView]) {
+    let multi = plans.len() > 1;
+    let title = if multi {
+        Span::styled(
+            format!(" PLAN  {} accounts ", plans.len()),
+            Style::default().fg(th.primary),
+        )
+    } else if plans.first().map(|p| p.usage.source) == Some(UsageSource::Estimate) {
         Span::styled(" PLAN  ~est (local) ", Style::default().fg(th.accent))
     } else {
         Span::styled(" PLAN  live ", Style::default().fg(th.primary))
@@ -117,23 +129,42 @@ fn gauges(f: &mut Frame, th: &Theme, area: Rect, usage: &UsageWindows) {
 
     let bar_w = (inner.width as i32 - 38).clamp(6, 40) as usize;
     let mut lines = Vec::new();
-    push_gauge(&mut lines, th, "5-HOUR", &usage.five_hour, est, bar_w);
-    push_gauge(&mut lines, th, "WEEKLY", &usage.seven_day, est, bar_w);
-    // Model-scoped weekly caps (Fable / Opus / Sonnet …) only matter once
-    // you've actually used the model.
-    for s in &usage.scoped {
-        if shown(&s.win) {
-            push_gauge(&mut lines, th, &format!("WK·{}", s.label), &Some(s.win.clone()), est, bar_w);
+    for p in plans {
+        let usage = &p.usage;
+        let est = usage.source == UsageSource::Estimate;
+        if multi {
+            // Account header row; a stale/pending account carries its note here.
+            let mut spans = vec![
+                Span::styled("▸ ", Style::default().fg(th.dim)),
+                Span::styled(p.label.clone(), Style::default().fg(th.secondary).add_modifier(Modifier::BOLD)),
+            ];
+            match (&usage.note, est) {
+                (Some(n), _) => spans.push(Span::styled(format!("  {n}"), Style::default().fg(th.dim))),
+                (None, false) => spans.push(Span::styled("  live", Style::default().fg(th.primary))),
+                (None, true) => spans.push(Span::styled("  ~est", Style::default().fg(th.accent))),
+            }
+            lines.push(Line::from(spans));
         }
-    }
-    if let Some(sp) = &usage.spend {
-        push_spend(&mut lines, th, sp, bar_w);
-    }
-    if let Some(note) = &usage.note {
-        lines.push(Line::from(Span::styled(
-            format!("  {note}"),
-            Style::default().fg(th.dim),
-        )));
+        push_gauge(&mut lines, th, "5-HOUR", &usage.five_hour, est, bar_w);
+        push_gauge(&mut lines, th, "WEEKLY", &usage.seven_day, est, bar_w);
+        // Model-scoped weekly caps (Fable / Opus / Sonnet …) only matter once
+        // you've actually used the model.
+        for s in &usage.scoped {
+            if shown(&s.win) {
+                push_gauge(&mut lines, th, &format!("WK·{}", s.label), &Some(s.win.clone()), est, bar_w);
+            }
+        }
+        if let Some(sp) = &usage.spend {
+            push_spend(&mut lines, th, sp, bar_w);
+        }
+        if !multi {
+            if let Some(note) = &usage.note {
+                lines.push(Line::from(Span::styled(
+                    format!("  {note}"),
+                    Style::default().fg(th.dim),
+                )));
+            }
+        }
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -339,10 +370,15 @@ fn bars_panel(f: &mut Frame, th: &Theme, area: Rect, title: &'static str,
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn footer(f: &mut Frame, th: &Theme, area: Rect, usage: &UsageWindows, n_sources: usize, sort_label: &str) {
-    let net = match usage.source {
-        UsageSource::Live => Span::styled("net:LIVE", Style::default().fg(th.primary)),
-        UsageSource::Estimate => Span::styled("net:EST", Style::default().fg(th.accent)),
+fn footer(f: &mut Frame, th: &Theme, area: Rect, plans: &[PlanView], n_sources: usize, sort_label: &str) {
+    let live_n = plans.iter().filter(|p| p.usage.source == UsageSource::Live).count();
+    let net = if plans.len() > 1 {
+        let color = if live_n == plans.len() { th.primary } else { th.accent };
+        Span::styled(format!("net:{live_n}/{}", plans.len()), Style::default().fg(color))
+    } else if live_n == 1 {
+        Span::styled("net:LIVE", Style::default().fg(th.primary))
+    } else {
+        Span::styled("net:EST", Style::default().fg(th.accent))
     };
     let mut spans = vec![
         Span::styled(" [q]", Style::default().fg(th.secondary)),

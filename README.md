@@ -96,7 +96,7 @@ Press `t` to cycle themes live — the pick is remembered across runs (`~/.confi
 
 By default cctop reads the same config dir Claude Code itself uses: `$CLAUDE_CONFIG_DIR` if set, otherwise `~/.claude`.
 
-If you run Claude Code under more than one config dir — a sandbox launched with a custom `CLAUDE_CONFIG_DIR`, or a second account — point cctop at the extras to watch **all** of their agents and token usage in one view. Pass the dir that contains `projects/` and `sessions/`:
+If you run Claude Code under more than one config dir — a sandbox launched with a custom `CLAUDE_CONFIG_DIR`, or a second account — point cctop at the extras to watch **all** of their agents, token usage **and plan limits** in one view. Pass the dir that contains `projects/` and `sessions/`:
 
 ```sh
 # repeatable flag
@@ -107,7 +107,11 @@ export CCTOP_CONFIG_DIRS=~/envs/sandbox/claude:~/envs/other/claude
 cctop
 ```
 
-Live agents and token totals are merged across every dir (duplicates collapse, missing dirs are ignored); the header account and live plan gauges follow the base dir. When more than one dir is active the footer shows `src:N`. With nothing extra set, behavior is unchanged — just `~/.claude`.
+Live agents and token totals are merged across every dir (duplicates collapse, missing dirs are ignored). Every dir that carries its own login (`.credentials.json`) gets its **own live plan section** — 5-hour, weekly and per-model weekly gauges per account — so you can watch several accounts' limits side by side:
+
+![multi-account](assets/multi-account.png)
+
+The header identity follows the base dir; a dir that has never logged in is skipped, and the same login mounted twice collapses to one section. When more than one dir is active the footer shows `src:N` and `net:live/total`. With nothing extra set, behavior is unchanged — just `~/.claude`, one plan section, exactly the classic layout.
 
 ## License
 
