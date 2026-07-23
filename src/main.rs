@@ -39,7 +39,7 @@ const EST_5H_BUDGET: u64 = 50_000_000;
 const EST_7D_BUDGET: u64 = 1_000_000_000;
 
 #[derive(Parser)]
-#[command(name = "cctop", about = "btop-style monitor for Claude usage & agents")]
+#[command(name = "cctop", version, about = "btop-style monitor for Claude usage & agents")]
 struct Args {
     /// Local refresh interval, in milliseconds.
     #[arg(long, default_value_t = 1000)]
@@ -148,6 +148,12 @@ impl App {
     }
 
     fn recompute_usage(&mut self) {
+        // Demo gauges are authored, not derived — never replace them with the
+        // estimate (or a live fetch would leak real account data into --demo).
+        if self.demo {
+            self.usage = demo::usage();
+            return;
+        }
         let fresh = self.live_at.map(|t| t.elapsed() < Duration::from_secs(180)).unwrap_or(false);
         self.usage = match (&self.live_usage, fresh) {
             (Some(u), true) => u.clone(),
@@ -279,7 +285,7 @@ fn main() {
     app.refresh();
 
     if args.once {
-        if !args.no_net {
+        if !args.no_net && !args.demo {
             let now_ms = Local::now().timestamp_millis();
             match account::ensure_and_fetch(&creds_path, now_ms) {
                 Ok(u) => {
