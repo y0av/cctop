@@ -9,6 +9,7 @@ mod snapshot;
 mod theme;
 mod transcripts;
 mod ui;
+mod update;
 
 use std::cmp::Ordering;
 use std::io::stdout;
@@ -50,6 +51,10 @@ struct Args {
     /// Disable network; estimate plan usage from local transcripts only.
     #[arg(long)]
     no_net: bool,
+    /// Don't check GitHub for a newer release on startup.
+    /// Also settable via the CCTOP_NO_UPDATE_CHECK env var.
+    #[arg(long)]
+    no_update_check: bool,
     /// Print one plain-text snapshot and exit (no TTY required).
     #[arg(long)]
     once: bool,
@@ -100,6 +105,8 @@ impl Sort {
 enum NetMsg {
     Live(usize, UsageWindows),
     Err(usize, String),
+    /// A release tag newer than this build, from the startup update check.
+    Update(String),
 }
 
 /// One account whose plan gauges we poll: a config dir with its own
@@ -192,6 +199,8 @@ struct App {
     no_net: bool,
     demo: bool,
     tick: u64,
+    /// Newer release tag once the startup check has found one.
+    update: Option<String>,
     tx: Sender<NetMsg>,
 }
 
@@ -291,6 +300,7 @@ impl App {
                         s.note = Some(e);
                     }
                 }
+                NetMsg::Update(tag) => self.update = Some(tag),
             }
         }
         self.recompute_usage();
@@ -485,9 +495,12 @@ fn main() {
         no_net: args.no_net,
         demo: args.demo,
         tick: 0,
+        update: None,
         tx: tx.clone(),
     };
     app.refresh();
+
+    let check_updates = !args.no_net && !args.demo && !args.no_update_check && !update::disabled_by_env();
 
     if args.once {
         if !args.no_net && !args.demo {
@@ -502,6 +515,11 @@ fn main() {
                 }
             }
             app.recompute_usage();
+        }
+        // Cache only: --once is meant to be script-fast, so it reports what a
+        // previous run already learned rather than adding a request.
+        if check_updates {
+            app.update = update::check(true);
         }
         print_once(&app);
         return;
@@ -523,6 +541,17 @@ fn main() {
                 }
             }
             std::thread::sleep(Duration::from_secs(60));
+        });
+    }
+
+    // One-shot release check, off the UI thread so a slow (or absent) network
+    // never delays the first frame.
+    if check_updates {
+        let txu = tx.clone();
+        std::thread::spawn(move || {
+            if let Some(tag) = update::check(false) {
+                let _ = txu.send(NetMsg::Update(tag));
+            }
         });
     }
 
@@ -554,9 +583,10 @@ fn run_tui(app: &mut App, rx: &mpsc::Receiver<NetMsg>, refresh_ms: u64) -> std::
         let n_sources = app.n_sources;
         let detail = if app.detail_on { app.selected_detail() } else { None };
         let th = &theme::THEMES[app.theme_idx];
+        let update = app.update.clone();
         term.draw(|f| {
             ui::draw(f, th, &app.account, &app.agg, &app.agents, &app.plans, detail.as_ref(),
-                     &mut app.table, sort_label, n_sources)
+                     &mut app.table, sort_label, n_sources, update.as_deref())
         })?;
 
         let timeout = tick.saturating_sub(last.elapsed());
@@ -696,6 +726,9 @@ fn print_once(app: &App) {
     println!("CCTOP — claude {} {}", a.subscription, a.rate_limit_tier);
     if !a.display_name.is_empty() || !a.org.is_empty() {
         println!("  {} · {}", a.display_name, a.org);
+    }
+    if let Some(tag) = &app.update {
+        println!("  update available: {tag} (running v{})", env!("CARGO_PKG_VERSION"));
     }
     for p in &app.plans {
         println!();

@@ -91,9 +91,27 @@ Press `t` to cycle themes live — the pick is remembered across runs (`~/.confi
 |------|--------------|
 | `--demo` | run with synthetic data — no account needed |
 | `--no-net` | local data only, never touch the network |
+| `--no-update-check` | skip the daily check for a newer release (see [Updating](#updating)) |
 | `--once` | print a one-shot text snapshot and exit |
 | `--theme NAME` | pick a theme (see [Themes](#themes)) |
 | `--config-dir DIR` | also read another Claude config dir (repeatable) — see [Multiple config dirs](#multiple-config-dirs) |
+
+## Updating
+
+cctop never updates itself. When a newer release exists, the header grows an `↑ v0.4.2` marker next to the version and you update by re-running whichever way you installed:
+
+```sh
+# installer (Linux/macOS) — same one-liner as the install
+curl -fsSL https://raw.githubusercontent.com/y0av/cctop/master/install.sh | sh
+
+# Windows
+irm https://raw.githubusercontent.com/y0av/cctop/master/install.ps1 | iex
+
+# cargo installs need --force, or cargo skips the reinstall
+cargo install --git https://github.com/y0av/cctop --force
+```
+
+The check asks the GitHub releases API for the latest tag at most **once a day** (the answer is cached in `~/.config/cctop/update`), on a background thread so it never delays a frame. It downloads nothing, sends nothing about you, and is skipped entirely under `--no-net` and `--demo`. To turn it off: `--no-update-check`, or set `CCTOP_NO_UPDATE_CHECK=1`.
 
 ## Multiple config dirs
 

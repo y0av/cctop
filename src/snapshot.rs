@@ -27,7 +27,8 @@ pub fn html(width: u16, height: u16, th: &Theme, multi: bool) -> String {
 
     let mut term = Terminal::new(TestBackend::new(width, height)).expect("test backend");
     term.draw(|f| {
-        ui::draw(f, th, &account, &agg, &agents, &plans, Some(&detail), &mut state, "burn", n_sources)
+        ui::draw(f, th, &account, &agg, &agents, &plans, Some(&detail), &mut state, "burn",
+                 n_sources, None)
     })
     .expect("draw");
     wrap(&buffer_to_pre(term.backend().buffer()))

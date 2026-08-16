@@ -21,7 +21,7 @@ const DETAIL_W: u16 = 34;
 
 pub fn draw(f: &mut Frame, th: &Theme, account: &Account, agg: &Aggregates, agents: &[LiveAgent],
             plans: &[PlanView], detail: Option<&AgentDetail>, state: &mut TableState,
-            sort_label: &str, n_sources: usize) {
+            sort_label: &str, n_sources: usize, update: Option<&str>) {
     let gauge_h = gauges_height(plans);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -34,7 +34,7 @@ pub fn draw(f: &mut Frame, th: &Theme, account: &Account, agg: &Aggregates, agen
         ])
         .split(f.area());
 
-    header(f, th, chunks[0], account);
+    header(f, th, chunks[0], account, update);
     gauges(f, th, chunks[1], plans);
     match detail {
         Some(d) if chunks[2].width >= DETAIL_MIN_W => {
@@ -94,14 +94,22 @@ fn panel<'a>(th: &Theme, title: Line<'a>) -> Block<'a> {
         .title(title)
 }
 
-fn header(f: &mut Frame, th: &Theme, area: Rect, account: &Account) {
+fn header(f: &mut Frame, th: &Theme, area: Rect, account: &Account, update: Option<&str>) {
     let tier = tier_label(&account.subscription, &account.rate_limit_tier);
     let mut left = vec![
         Span::styled("CCTOP", Style::default().fg(th.primary).add_modifier(Modifier::BOLD)),
         Span::styled(concat!(" v", env!("CARGO_PKG_VERSION")), Style::default().fg(th.dim)),
+    ];
+    if let Some(tag) = update {
+        left.push(Span::styled(
+            format!(" ↑{tag}"),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ));
+    }
+    left.extend([
         Span::styled("  claude ", Style::default().fg(th.dim)),
         Span::styled(tier.clone(), Style::default().fg(th.secondary).add_modifier(Modifier::BOLD)),
-    ];
+    ]);
 
     let who = {
         let mut s = String::new();
