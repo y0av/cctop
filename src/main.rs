@@ -762,13 +762,22 @@ fn print_once(app: &App) {
     } else {
         println!("LIVE AGENTS ({} running)", app.agents.len());
     }
-    println!("  {:<8} {:<22} {:<18} {:<11} {:<6} {:>8} {:>8} {:>8}",
+    // No terminal to fit here, so the name column takes the width it needs
+    // (up to a sane cap) instead of ellipsizing at a fixed one.
+    let name_w = app
+        .agents
+        .iter()
+        .map(|a| if a.name.is_empty() { a.project.chars().count() } else { a.name.chars().count() })
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 44);
+    println!("  {:<8} {:<name_w$} {:<18} {:<11} {:<6} {:>8} {:>8} {:>8}",
         "PID", "NAME", "PROJECT", "MODEL", "ST", "UP", "MEM", "tok/s");
     for ag in &app.agents {
         println!(
-            "  {:<8} {:<22} {:<18} {:<11} {:<6} {:>8} {:>7}M {:>8}",
+            "  {:<8} {:<name_w$} {:<18} {:<11} {:<6} {:>8} {:>7}M {:>8}",
             ag.pid,
-            short(if ag.name.is_empty() { &ag.project } else { &ag.name }, 22),
+            short(if ag.name.is_empty() { &ag.project } else { &ag.name }, name_w),
             short(&ag.project, 18),
             ag.model.strip_prefix("claude-").unwrap_or(&ag.model),
             ag.status,

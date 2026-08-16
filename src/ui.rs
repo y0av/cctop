@@ -18,6 +18,24 @@ use crate::transcripts::Aggregates;
 /// Minimum terminal width before the drill-down panel is offered.
 const DETAIL_MIN_W: u16 = 96;
 const DETAIL_W: u16 = 34;
+/// Floor for the agents table's flexible NAME column.
+const NAME_MIN: u16 = 14;
+
+/// How wide the single `Min` column of a table ends up: everything the fixed
+/// columns, the panel borders, the selection marker and the inter-column
+/// spacing don't claim. Mirrors what ratatui's layout will do, so a name can be
+/// truncated to exactly the room it has rather than to a guessed constant.
+fn flex_width(area_w: u16, widths: &[Constraint]) -> u16 {
+    let fixed: u16 = widths
+        .iter()
+        .map(|c| match c {
+            Constraint::Length(n) => *n,
+            _ => 0,
+        })
+        .sum();
+    let gaps = widths.len().saturating_sub(1) as u16; // one space between columns
+    area_w.saturating_sub(2 + 1 + gaps + fixed).max(NAME_MIN) // borders + "▶"
+}
 
 pub fn draw(f: &mut Frame, th: &Theme, account: &Account, agg: &Aggregates, agents: &[LiveAgent],
             plans: &[PlanView], detail: Option<&AgentDetail>, state: &mut TableState,
@@ -307,6 +325,23 @@ fn agents_table(f: &mut Frame, th: &Theme, area: Rect, agents: &[LiveAgent],
     let header = Row::new(cols.into_iter().map(Cell::from))
         .style(Style::default().fg(th.dim).add_modifier(Modifier::BOLD));
 
+    // Widths first, because NAME is the one flexible column and the rows need
+    // to know how wide it ended up: truncating to a fixed cap would ellipsize
+    // names that the terminal has room to show in full.
+    let mut widths = vec![Constraint::Length(7), Constraint::Min(NAME_MIN)];
+    if !compact {
+        widths.push(Constraint::Length(19));
+    }
+    if show_acc {
+        widths.push(Constraint::Length(8));
+    }
+    widths.extend([Constraint::Length(11), Constraint::Length(6), Constraint::Length(7)]);
+    if !compact {
+        widths.extend([Constraint::Length(7), Constraint::Length(9)]);
+    }
+    widths.push(Constraint::Length(6));
+    let name_w = flex_width(area.width, &widths) as usize;
+
     let rows = agents.iter().map(|a| {
         let busy = a.status == "busy";
         let st = if busy {
@@ -329,7 +364,7 @@ fn agents_table(f: &mut Frame, th: &Theme, area: Rect, agents: &[LiveAgent],
         };
         let mut cells = vec![
             Cell::from(a.pid.to_string()).style(Style::default().fg(th.text)),
-            Cell::from(truncate(name, 22)).style(name_style),
+            Cell::from(truncate(name, name_w)).style(name_style),
         ];
         if !compact {
             cells.push(Cell::from(truncate(&a.project, 18)).style(Style::default().fg(th.dim)));
@@ -355,18 +390,6 @@ fn agents_table(f: &mut Frame, th: &Theme, area: Rect, agents: &[LiveAgent],
         Row::new(cells)
     });
 
-    let mut widths = vec![Constraint::Length(7), Constraint::Min(14)];
-    if !compact {
-        widths.push(Constraint::Length(19));
-    }
-    if show_acc {
-        widths.push(Constraint::Length(8));
-    }
-    widths.extend([Constraint::Length(11), Constraint::Length(6), Constraint::Length(7)]);
-    if !compact {
-        widths.extend([Constraint::Length(7), Constraint::Length(9)]);
-    }
-    widths.push(Constraint::Length(6));
     let table = Table::new(rows, widths)
         .header(header)
         .block(block)
@@ -380,8 +403,10 @@ fn agents_table(f: &mut Frame, th: &Theme, area: Rect, agents: &[LiveAgent],
 /// Drill-down for the selected agent: session totals, cost, freshness.
 fn detail_panel(f: &mut Frame, th: &Theme, area: Rect, d: &AgentDetail) {
     let head = if d.name.is_empty() { &d.project } else { &d.name };
+    // Borders plus the " ▶ " prefix and the trailing space.
+    let head_w = area.width.saturating_sub(6) as usize;
     let title = Line::from(Span::styled(
-        format!(" ▶ {} ", truncate(head, 24)),
+        format!(" ▶ {} ", truncate(head, head_w)),
         Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
     ));
     let block = panel(th, title);
