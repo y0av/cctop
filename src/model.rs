@@ -77,6 +77,8 @@ pub struct PlanView {
 
 /// Everything the drill-down panel shows about the selected agent.
 pub struct AgentDetail {
+    /// Session name; empty falls back to the project in the panel title.
+    pub name: String,
     pub project: String,
     pub account: String,
     pub model: String,

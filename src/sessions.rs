@@ -19,11 +19,23 @@ struct SessionFile {
     started_at: Option<i64>, // ms epoch
     status: Option<String>,
     kind: Option<String>,
+    /// Session name. Claude Code derives one from the cwd at startup and
+    /// rewrites the file when a session is renamed, so re-reading each tick is
+    /// all it takes to track renames.
+    name: Option<String>,
+    /// "derived" for the auto-generated cwd-based name; anything else means the
+    /// name was chosen (by the agent or the user).
+    #[serde(rename = "nameSource")]
+    name_source: Option<String>,
 }
 
 pub struct LiveAgent {
     pub pid: i32,
     pub session_id: String,
+    /// Session name, empty when the session file predates named sessions.
+    pub name: String,
+    /// The name was chosen rather than derived from the cwd — worth highlighting.
+    pub named: bool,
     pub project: String,
     /// Which config dir (account env) this session belongs to.
     pub account: String,
@@ -91,9 +103,14 @@ pub fn read(sessions_dirs: &[(PathBuf, String)], store: &Store, now_ms: i64) -> 
             store.session_burn(&session_id, now_secs, 60, 8)
         };
 
+        let name = sf.name.unwrap_or_default();
+        let named = !name.is_empty() && sf.name_source.as_deref().unwrap_or("derived") != "derived";
+
         out.push(LiveAgent {
             pid: sf.pid,
             session_id,
+            name,
+            named,
             project: transcripts::project_name(&cwd).to_string(),
             account: sessions_dirs[di].1.clone(),
             cwd,

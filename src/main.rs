@@ -322,6 +322,7 @@ impl App {
             .get(&a.session_id)
             .map(|(ts, _)| (Local::now().timestamp() - ts).max(0));
         Some(AgentDetail {
+            name: a.name.clone(),
             project: a.project.clone(),
             account: a.account.clone(),
             model: a.model.clone(),
@@ -728,11 +729,13 @@ fn print_once(app: &App) {
     } else {
         println!("LIVE AGENTS ({} running)", app.agents.len());
     }
-    println!("  {:<8} {:<18} {:<11} {:<6} {:>8} {:>8} {:>8}", "PID", "PROJECT", "MODEL", "ST", "UP", "MEM", "tok/s");
+    println!("  {:<8} {:<22} {:<18} {:<11} {:<6} {:>8} {:>8} {:>8}",
+        "PID", "NAME", "PROJECT", "MODEL", "ST", "UP", "MEM", "tok/s");
     for ag in &app.agents {
         println!(
-            "  {:<8} {:<18} {:<11} {:<6} {:>8} {:>7}M {:>8}",
+            "  {:<8} {:<22} {:<18} {:<11} {:<6} {:>8} {:>7}M {:>8}",
             ag.pid,
+            short(if ag.name.is_empty() { &ag.project } else { &ag.name }, 22),
             short(&ag.project, 18),
             ag.model.strip_prefix("claude-").unwrap_or(&ag.model),
             ag.status,

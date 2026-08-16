@@ -281,9 +281,13 @@ fn agents_table(f: &mut Frame, th: &Theme, area: Rect, agents: &[LiveAgent],
     ]);
     let block = panel(th, title);
 
-    // With the detail panel open the table is narrow; MEM and the burn
-    // sparkline move into the panel instead of getting crushed here.
-    let mut cols = vec!["PID", "PROJECT"];
+    // With the detail panel open the table is narrow; MEM, the burn sparkline
+    // and PROJECT move into the panel instead of getting crushed here (the
+    // name is derived from the project, so it carries that information).
+    let mut cols = vec!["PID", "NAME"];
+    if !compact {
+        cols.push("PROJECT");
+    }
     if show_acc {
         cols.push("ACC");
     }
@@ -305,10 +309,23 @@ fn agents_table(f: &mut Frame, th: &Theme, area: Rect, agents: &[LiveAgent],
             Span::styled(format!("·{}", a.status), Style::default().fg(th.dim))
         };
         let burn_color = if a.burn_tps > 0.5 { th.primary } else { th.dim };
+        // A chosen name (agent- or user-set) gets the accent; the cwd-derived
+        // default stays quiet. Sessions from older releases have no name at
+        // all, so fall back to the project.
+        let (name, name_style) = if a.name.is_empty() {
+            (a.project.as_str(), Style::default().fg(th.secondary))
+        } else if a.named {
+            (a.name.as_str(), Style::default().fg(th.accent).add_modifier(Modifier::BOLD))
+        } else {
+            (a.name.as_str(), Style::default().fg(th.secondary))
+        };
         let mut cells = vec![
             Cell::from(a.pid.to_string()).style(Style::default().fg(th.text)),
-            Cell::from(truncate(&a.project, 18)).style(Style::default().fg(th.secondary)),
+            Cell::from(truncate(name, 22)).style(name_style),
         ];
+        if !compact {
+            cells.push(Cell::from(truncate(&a.project, 18)).style(Style::default().fg(th.dim)));
+        }
         if show_acc {
             cells.push(Cell::from(truncate(&a.account, 7)).style(Style::default().fg(th.dim)));
         }
@@ -330,7 +347,10 @@ fn agents_table(f: &mut Frame, th: &Theme, area: Rect, agents: &[LiveAgent],
         Row::new(cells)
     });
 
-    let mut widths = vec![Constraint::Length(7), Constraint::Min(11)];
+    let mut widths = vec![Constraint::Length(7), Constraint::Min(14)];
+    if !compact {
+        widths.push(Constraint::Length(19));
+    }
     if show_acc {
         widths.push(Constraint::Length(8));
     }
@@ -351,8 +371,9 @@ fn agents_table(f: &mut Frame, th: &Theme, area: Rect, agents: &[LiveAgent],
 
 /// Drill-down for the selected agent: session totals, cost, freshness.
 fn detail_panel(f: &mut Frame, th: &Theme, area: Rect, d: &AgentDetail) {
+    let head = if d.name.is_empty() { &d.project } else { &d.name };
     let title = Line::from(Span::styled(
-        format!(" ▶ {} ", truncate(&d.project, 24)),
+        format!(" ▶ {} ", truncate(head, 24)),
         Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
     ));
     let block = panel(th, title);

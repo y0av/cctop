@@ -74,9 +74,13 @@ pub fn agents(tick: u64) -> Vec<LiveAgent> {
         let n = base.len();
         (0..n).map(|i| base[(i + t as usize) % n]).collect()
     };
-    let a = |pid: i32, project: &str, model: &str, status: &str, up: i64, rss_mb: u64, tps: f64, hist: Vec<u64>| LiveAgent {
+    // `name` carries a trailing "*" in the demo table to mark a chosen (rather
+    // than cwd-derived) name, matching what `named` highlights for real runs.
+    let a = |pid: i32, name: &str, project: &str, model: &str, status: &str, up: i64, rss_mb: u64, tps: f64, hist: Vec<u64>| LiveAgent {
         pid,
         session_id: String::new(),
+        name: name.trim_end_matches('*').into(),
+        named: name.ends_with('*'),
         project: project.into(),
         account: "ada".into(),
         cwd: format!("/home/ada/dev/{project}"),
@@ -89,13 +93,13 @@ pub fn agents(tick: u64) -> Vec<LiveAgent> {
         kind: "interactive".into(),
     };
     vec![
-        a(48213, "api-gateway", "claude-fable-5", "busy", 264, 345,
+        a(48213, "rate-limit-fix*", "api-gateway", "claude-fable-5", "busy", 264, 345,
             78.0 + (tick % 7) as f64, roll(&[40, 58, 72, 61, 84, 76, 91, 80], tick)),
-        a(47190, "web-frontend", "claude-sonnet-4-6", "busy", 743, 410,
+        a(47190, "checkout-redesign*", "web-frontend", "claude-sonnet-4-6", "busy", 743, 410,
             52.0 + (tick % 5) as f64, roll(&[30, 42, 38, 55, 48, 60, 52, 46], tick + 3)),
-        a(46055, "data-pipeline", "claude-opus-4-8", "idle", 4080, 467, 0.0, vec![1, 1, 2, 1, 1, 1, 2, 1]),
-        a(44820, "infra-terraform", "claude-haiku-4-5", "idle", 13260, 388, 0.0, vec![1; 8]),
-        a(43771, "docs-site", "claude-opus-4-8", "shell", 22320, 502, 0.0, vec![1; 8]),
+        a(46055, "data-pipeline-7b", "data-pipeline", "claude-opus-4-8", "idle", 4080, 467, 0.0, vec![1, 1, 2, 1, 1, 1, 2, 1]),
+        a(44820, "infra-terraform-2c", "infra-terraform", "claude-haiku-4-5", "idle", 13260, 388, 0.0, vec![1; 8]),
+        a(43771, "docs-site-e4", "docs-site", "claude-opus-4-8", "shell", 22320, 502, 0.0, vec![1; 8]),
     ]
 }
 
@@ -103,6 +107,7 @@ pub fn agents(tick: u64) -> Vec<LiveAgent> {
 pub fn detail(a: &LiveAgent) -> AgentDetail {
     let busy = a.status == "busy";
     AgentDetail {
+        name: a.name.clone(),
         project: a.project.clone(),
         account: a.account.clone(),
         model: a.model.clone(),
