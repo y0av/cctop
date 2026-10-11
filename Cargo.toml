@@ -1,6 +1,6 @@
 [package]
 name = "cctop"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2024"
 description = "btop-style terminal monitor for Claude usage & running Claude Code agents"
 license = "MIT"

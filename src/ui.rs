@@ -10,6 +10,7 @@ use ratatui::Frame;
 
 use crate::account::Account;
 use crate::model::{AgentDetail, PlanView, Spend, UsageSource, UsageWindows, Window};
+use crate::procs::{self, SysStats};
 use crate::sessions::LiveAgent;
 use crate::theme::Theme;
 use crate::theme;
@@ -17,7 +18,9 @@ use crate::transcripts::Aggregates;
 
 /// Minimum terminal width before the drill-down panel is offered.
 const DETAIL_MIN_W: u16 = 96;
-const DETAIL_W: u16 = 34;
+const DETAIL_W: u16 = 40;
+/// Lines taken by the system strip under the header.
+const SYS_H: u16 = 2;
 /// Floor for the agents table's flexible NAME column.
 const NAME_MIN: u16 = 14;
 
@@ -37,14 +40,16 @@ fn flex_width(area_w: u16, widths: &[Constraint]) -> u16 {
     area_w.saturating_sub(2 + 1 + gaps + fixed).max(NAME_MIN) // borders + "▶"
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw(f: &mut Frame, th: &Theme, account: &Account, agg: &Aggregates, agents: &[LiveAgent],
-            plans: &[PlanView], detail: Option<&AgentDetail>, state: &mut TableState,
-            sort_label: &str, n_sources: usize, update: Option<&str>) {
+            plans: &[PlanView], sys: &SysStats, detail: Option<&AgentDetail>,
+            state: &mut TableState, sort_label: &str, n_sources: usize, update: Option<&str>) {
     let gauge_h = gauges_height(plans);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),       // header
+            Constraint::Length(SYS_H),   // system strip
             Constraint::Length(gauge_h), // gauges
             Constraint::Min(6),          // agents
             Constraint::Length(8),       // bottom row
@@ -53,20 +58,228 @@ pub fn draw(f: &mut Frame, th: &Theme, account: &Account, agg: &Aggregates, agen
         .split(f.area());
 
     header(f, th, chunks[0], account, update);
-    gauges(f, th, chunks[1], plans);
+    sys_strip(f, th, chunks[1], sys, agents);
+    gauges(f, th, chunks[2], plans);
     match detail {
-        Some(d) if chunks[2].width >= DETAIL_MIN_W => {
+        Some(d) if chunks[3].width >= DETAIL_MIN_W => {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Min(40), Constraint::Length(DETAIL_W)])
-                .split(chunks[2]);
-            agents_table(f, th, cols[0], agents, state, n_sources > 1, true);
-            detail_panel(f, th, cols[1], d);
+                .split(chunks[3]);
+            agents_table(f, th, cols[0], agents, sys, state, n_sources > 1, true);
+            detail_panel(f, th, cols[1], d, sys);
         }
-        _ => agents_table(f, th, chunks[2], agents, state, n_sources > 1, false),
+        _ => agents_table(f, th, chunks[3], agents, sys, state, n_sources > 1, false),
     }
-    bottom(f, th, chunks[3], agg);
-    footer(f, th, chunks[4], plans, n_sources, sort_label);
+    bottom(f, th, chunks[4], agg);
+    footer(f, th, chunks[5], plans, n_sources, sort_label);
+}
+
+/// CPU cell color: one full core is notable, half the machine (capped at four
+/// cores) is the agent to look at.
+fn cpu_color(th: &Theme, cpu: f32, ncpu: usize) -> ratatui::style::Color {
+    let crit = ((ncpu as f32 * 100.0) / 2.0).clamp(100.0, 400.0);
+    if cpu >= crit {
+        th.crit
+    } else if cpu >= 100.0 {
+        th.warn
+    } else if cpu < 1.0 {
+        th.dim
+    } else {
+        th.text
+    }
+}
+
+fn mem_color(th: &Theme, kb: u64, total_kb: u64) -> ratatui::style::Color {
+    let frac = kb as f64 / total_kb.max(1) as f64;
+    if frac >= 0.25 {
+        th.crit
+    } else if frac >= 0.10 {
+        th.warn
+    } else {
+        th.text
+    }
+}
+
+/// Two lines under the header: machine gauges, then what (if anything) is
+/// wrong and which agent to blame.
+fn sys_strip(f: &mut Frame, th: &Theme, area: Rect, s: &SysStats, agents: &[LiveAgent]) {
+    let lbl = |t: &str| Span::styled(t.to_string(), Style::default().fg(th.dim));
+    let bar = |frac: f64, w: usize| -> Vec<Span<'static>> {
+        let (fill, empty) = th.gauge_parts(frac, w);
+        let c = th.gauge_color(frac);
+        vec![
+            Span::styled("[", Style::default().fg(th.dim)),
+            Span::styled(fill, Style::default().fg(c)),
+            Span::styled(empty, Style::default().fg(th.dim)),
+            Span::styled("]", Style::default().fg(th.dim)),
+        ]
+    };
+    let bw = if area.width >= 150 { 10 } else { 6 };
+
+    // Segments in display order, each with a priority; on a narrow terminal
+    // the least important ones drop out instead of the line being clipped.
+    let mut segs: Vec<(u8, Vec<Span<'static>>)> = Vec::new();
+    let cpu_frac = s.cpu as f64 / 100.0;
+    let mut seg = vec![lbl("cpu ")];
+    seg.extend(bar(cpu_frac, bw));
+    seg.push(Span::styled(
+        format!(" {:.0}%", s.cpu),
+        Style::default().fg(th.gauge_color(cpu_frac)).add_modifier(Modifier::BOLD),
+    ));
+    seg.push(lbl(&format!(" {}c", s.ncpu)));
+    segs.push((9, seg));
+
+    let mem_frac = s.mem_used_kb as f64 / s.mem_total_kb.max(1) as f64;
+    let mut seg = vec![lbl("mem ")];
+    seg.extend(bar(mem_frac, bw));
+    seg.push(Span::styled(
+        format!(" {}/{}", procs::fmt_kb(s.mem_used_kb), procs::fmt_kb(s.mem_total_kb)),
+        Style::default().fg(th.gauge_color(mem_frac)).add_modifier(Modifier::BOLD),
+    ));
+    segs.push((9, seg));
+    if s.swap_used_kb > 0 {
+        let sf = s.swap_used_kb as f64 / s.swap_total_kb.max(1) as f64;
+        segs.push((if sf >= 0.5 { 8 } else { 4 }, vec![
+            lbl("swap "),
+            Span::styled(
+                format!("{}/{}", procs::fmt_kb(s.swap_used_kb), procs::fmt_kb(s.swap_total_kb)),
+                Style::default().fg(th.gauge_color(sf)),
+            ),
+        ]));
+    }
+    if let Some(g) = &s.gpu {
+        let gf = g.busy.unwrap_or(0.0) as f64 / 100.0;
+        let mut seg = vec![lbl("gpu ")];
+        seg.extend(bar(gf, bw));
+        seg.push(Span::styled(
+            g.busy.map(|b| format!(" {b:.0}%")).unwrap_or_else(|| " —".into()),
+            Style::default().fg(th.gauge_color(gf)).add_modifier(Modifier::BOLD),
+        ));
+        segs.push((7, seg));
+        if g.vram_total_kb > 0 {
+            let vf = g.vram_used_kb as f64 / g.vram_total_kb as f64;
+            segs.push((3, vec![
+                lbl("vram "),
+                Span::styled(
+                    format!("{}/{}", procs::fmt_kb(g.vram_used_kb), procs::fmt_kb(g.vram_total_kb)),
+                    Style::default().fg(th.gauge_color(vf)),
+                ),
+            ]));
+        }
+        if g.gtt_used_kb > 0 && g.gtt_total_kb > 0 {
+            segs.push((2, vec![lbl("gtt "), Span::styled(procs::fmt_kb(g.gtt_used_kb), Style::default().fg(th.text))]));
+        }
+    }
+    if let (Some(c), Some(m), Some(io)) = (s.psi_cpu, s.psi_mem, s.psi_io) {
+        // Pressure: share of the last 10 s something stalled waiting.
+        let pc = |v: f32| if v >= 20.0 { th.crit } else if v >= 5.0 { th.warn } else { th.dim };
+        let hot = c.max(m).max(io) >= 5.0;
+        segs.push((if hot { 8 } else { 5 }, vec![
+            lbl("stall "),
+            Span::styled(format!("cpu {c:.0}%"), Style::default().fg(pc(c))),
+            Span::styled(format!(" mem {m:.0}%"), Style::default().fg(pc(m))),
+            Span::styled(format!(" io {io:.0}%"), Style::default().fg(pc(io))),
+        ]));
+    }
+    segs.push((1, vec![lbl(&format!("load {:.1}", s.load.0))]));
+
+    let width = |v: &[(u8, Vec<Span<'static>>)]| -> usize {
+        5 + v.iter().map(|(_, sp)| 2 + sp.iter().map(|x| x.content.chars().count()).sum::<usize>()).sum::<usize>()
+    };
+    while width(&segs) > area.width as usize && segs.len() > 1 {
+        let (idx, _) = segs.iter().enumerate().min_by_key(|(i, (p, _))| (*p, usize::MAX - i)).unwrap();
+        segs.remove(idx);
+    }
+    let mut l1 = vec![Span::styled(" SYS ", Style::default().fg(th.secondary).add_modifier(Modifier::BOLD))];
+    for (i, (_, sp)) in segs.into_iter().enumerate() {
+        if i > 0 {
+            l1.push(Span::raw("  "));
+        }
+        l1.extend(sp);
+    }
+
+    let l2 = Line::from(alerts(th, s, agents));
+    let lines = vec![Line::from(l1), l2];
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// The diagnosis line: the hungriest agent and what inside it is hungry, plus
+/// orphans and machine-level pressure.
+fn alerts(th: &Theme, s: &SysStats, agents: &[LiveAgent]) -> Vec<Span<'static>> {
+    let mut out = vec![Span::raw("     ")];
+    let sep = |out: &mut Vec<Span<'static>>| {
+        if out.len() > 1 {
+            out.push(Span::styled("  ·  ", Style::default().fg(th.dim)));
+        }
+    };
+
+    let hottest = agents
+        .iter()
+        .filter(|a| a.status != "orphan")
+        .max_by(|a, b| a.cpu.partial_cmp(&b.cpu).unwrap_or(std::cmp::Ordering::Equal));
+    if let Some(a) = hottest {
+        let c = cpu_color(th, a.cpu, s.ncpu);
+        let hot = a.cpu >= 100.0;
+        out.push(Span::styled(
+            if hot { "▲ hottest " } else { "top " },
+            Style::default().fg(if hot { c } else { th.dim }),
+        ));
+        out.push(Span::styled(
+            truncate(if a.name.is_empty() { &a.project } else { &a.name }, 28),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ));
+        out.push(Span::styled(
+            format!(" {} {}", procs::fmt_cores(a.cpu), procs::fmt_kb(a.rss_kb)),
+            Style::default().fg(c).add_modifier(Modifier::BOLD),
+        ));
+        if let Some(p) = a.top.first().filter(|_| a.cpu >= 5.0) {
+            out.push(Span::styled(
+                format!(" ← {}", truncate(&p.cmd, 32)),
+                Style::default().fg(th.text),
+            ));
+        }
+    }
+
+    let orphans: Vec<&LiveAgent> = agents.iter().filter(|a| a.status == "orphan").collect();
+    if !orphans.is_empty() {
+        sep(&mut out);
+        let n: usize = orphans.iter().map(|a| a.nprocs).sum();
+        let cpu: f32 = orphans.iter().map(|a| a.cpu).sum();
+        out.push(Span::styled(
+            format!("† {n} orphan procs from dead sessions, {}", procs::fmt_cores(cpu)),
+            Style::default().fg(th.crit).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let warn = |out: &mut Vec<Span<'static>>, text: String| {
+        sep(out);
+        out.push(Span::styled(text, Style::default().fg(th.crit).add_modifier(Modifier::BOLD)));
+    };
+    if s.psi_mem.unwrap_or(0.0) >= 10.0 {
+        warn(&mut out, "memory pressure: system is thrashing".into());
+    } else if s.mem_used_kb as f64 / s.mem_total_kb.max(1) as f64 >= 0.9 {
+        warn(&mut out, "RAM nearly full".into());
+    }
+    if s.psi_cpu.unwrap_or(0.0) >= 40.0 || s.cpu >= 95.0 {
+        warn(&mut out, "CPU saturated".into());
+    }
+    if s.psi_io.unwrap_or(0.0) >= 30.0 {
+        warn(&mut out, "IO stalls".into());
+    }
+    if s.swap_total_kb > 0 && s.swap_used_kb as f64 / s.swap_total_kb as f64 >= 0.5 {
+        warn(&mut out, "swap over half full".into());
+    }
+    if let Some(g) = &s.gpu {
+        if g.vram_total_kb > 0 && g.vram_used_kb as f64 / g.vram_total_kb as f64 >= 0.95 {
+            // On an APU the VRAM carve-out is tiny and spills into system RAM
+            // (GTT), so this only matters when GTT is absent or also full.
+            if g.gtt_total_kb == 0 || g.gtt_used_kb as f64 / g.gtt_total_kb as f64 >= 0.8 {
+                warn(&mut out, "GPU memory full".into());
+            }
+        }
+    }
+    out
 }
 
 /// Height of the plan block for the current set of accounts — shared with the
@@ -80,7 +293,7 @@ pub fn gauges_height(plans: &[PlanView]) -> u16 {
 /// Which visible agents-table row (0-based, pre-scroll) a click at terminal
 /// row `y` lands on, if any.
 pub fn agents_row_at(size: ratatui::layout::Size, plans: &[PlanView], y: u16) -> Option<usize> {
-    let top = 1 + gauges_height(plans); // header + plan block
+    let top = 1 + SYS_H + gauges_height(plans); // header + system strip + plan block
     let table_h = size.height.saturating_sub(top + 8 + 1); // bottom row + footer
     // First two rows are the block border and the column header; the last is
     // the bottom border.
@@ -295,98 +508,126 @@ fn push_spend(lines: &mut Vec<Line<'static>>, th: &Theme, sp: &Spend, bar_w: usi
     ]));
 }
 
-fn agents_table(f: &mut Frame, th: &Theme, area: Rect, agents: &[LiveAgent],
+#[allow(clippy::too_many_arguments)]
+fn agents_table(f: &mut Frame, th: &Theme, area: Rect, agents: &[LiveAgent], sys: &SysStats,
                 state: &mut TableState, show_acc: bool, compact: bool) {
     let busy = agents.iter().filter(|a| a.status == "busy").count();
+    let total_cpu: f32 = agents.iter().map(|a| a.cpu).sum();
     let title = Line::from(vec![
         Span::styled(" LIVE AGENTS ", Style::default().fg(th.secondary).add_modifier(Modifier::BOLD)),
         Span::styled(
-            format!("{} live · {} busy ", agents.len(), busy),
+            format!("{} live · {} busy · {} ", agents.len(), busy, procs::fmt_cores(total_cpu)),
             Style::default().fg(th.dim),
         ),
     ]);
     let block = panel(th, title);
+    let show_gpu = sys.gpu.is_some() || agents.iter().any(|a| a.gpu.is_some());
 
-    // With the detail panel open the table is narrow; MEM, the burn sparkline
-    // and PROJECT move into the panel instead of getting crushed here (the
-    // name is derived from the project, so it carries that information).
-    let mut cols = vec!["PID", "NAME"];
+    // Column set. With the detail panel open the table is narrow: PID, MODEL,
+    // UP and the sparkline move into the panel and SESSION/REPO keep the room.
+    // CPU/MEM/GPU always stay — they're what you scan for a runaway agent.
+    let wide = !compact && area.width >= 118;
+    let mut cols: Vec<(&str, Constraint)> = Vec::new();
     if !compact {
-        cols.push("PROJECT");
+        cols.push(("PID", Constraint::Length(7)));
     }
+    cols.push(("SESSION", Constraint::Min(NAME_MIN)));
+    cols.push(("REPO", Constraint::Length(if compact { 15 } else { 20 })));
     if show_acc {
-        cols.push("ACC");
+        cols.push(("ACC", Constraint::Length(8)));
     }
-    cols.extend(["MODEL", "ST", "UP"]);
     if !compact {
-        cols.extend(["MEM", "BURN"]);
+        cols.push(("MODEL", Constraint::Length(11)));
     }
-    cols.push("tok/s");
-    let header = Row::new(cols.into_iter().map(Cell::from))
-        .style(Style::default().fg(th.dim).add_modifier(Modifier::BOLD));
+    cols.push(("ST", Constraint::Length(6)));
+    if !compact {
+        cols.push(("UP", Constraint::Length(7)));
+    }
+    cols.push(("CORES", Constraint::Length(5)));
+    cols.push(("MEM", Constraint::Length(6)));
+    if show_gpu {
+        cols.push(("GPU", Constraint::Length(4)));
+    }
+    if wide {
+        cols.push(("BURN", Constraint::Length(9)));
+    }
+    if !compact {
+        cols.push(("tok/s", Constraint::Length(6)));
+    }
 
-    // Widths first, because NAME is the one flexible column and the rows need
-    // to know how wide it ended up: truncating to a fixed cap would ellipsize
-    // names that the terminal has room to show in full.
-    let mut widths = vec![Constraint::Length(7), Constraint::Min(NAME_MIN)];
-    if !compact {
-        widths.push(Constraint::Length(19));
-    }
-    if show_acc {
-        widths.push(Constraint::Length(8));
-    }
-    widths.extend([Constraint::Length(11), Constraint::Length(6), Constraint::Length(7)]);
-    if !compact {
-        widths.extend([Constraint::Length(7), Constraint::Length(9)]);
-    }
-    widths.push(Constraint::Length(6));
+    let header = Row::new(cols.iter().map(|(h, _)| {
+        // Right-align numeric headers over their right-aligned values.
+        if matches!(*h, "CORES" | "MEM" | "GPU") {
+            Cell::from(Line::from(*h).alignment(Alignment::Right))
+        } else {
+            Cell::from(*h)
+        }
+    }))
+    .style(Style::default().fg(th.dim).add_modifier(Modifier::BOLD));
+    let widths: Vec<Constraint> = cols.iter().map(|(_, c)| *c).collect();
     let name_w = flex_width(area.width, &widths) as usize;
+    let repo_w = if compact { 15 } else { 20 };
+
+    let right = |s: String, color| Cell::from(Line::from(s).alignment(Alignment::Right)).style(Style::default().fg(color));
 
     let rows = agents.iter().map(|a| {
         let busy = a.status == "busy";
-        let st = if busy {
-            Span::styled("●busy", Style::default().fg(th.primary))
-        } else if a.status == "idle" {
-            Span::styled("○idle", Style::default().fg(th.dim))
-        } else {
-            Span::styled(format!("·{}", a.status), Style::default().fg(th.dim))
+        let st = match a.status.as_str() {
+            "busy" => Span::styled("●busy", Style::default().fg(th.primary)),
+            "idle" => Span::styled("○idle", Style::default().fg(th.dim)),
+            "orphan" => Span::styled("†orph", Style::default().fg(th.crit).add_modifier(Modifier::BOLD)),
+            "unreg" => Span::styled("?unrg", Style::default().fg(th.warn)),
+            other => Span::styled(format!("·{other}"), Style::default().fg(th.dim)),
         };
         let burn_color = if a.burn_tps > 0.5 { th.primary } else { th.dim };
-        // A chosen name (agent- or user-set) gets the accent; the cwd-derived
-        // default stays quiet. Sessions from older releases have no name at
-        // all, so fall back to the project.
-        let (name, name_style) = if a.name.is_empty() {
+        // A chosen name (agent- or user-set) gets the accent; generated titles
+        // and the cwd-derived default stay quiet. Sessions from older releases
+        // have no name at all, so fall back to the project.
+        let (name, name_style) = if a.status == "orphan" {
+            (a.name.as_str(), Style::default().fg(th.crit))
+        } else if a.name.is_empty() {
             (a.project.as_str(), Style::default().fg(th.secondary))
         } else if a.named {
             (a.name.as_str(), Style::default().fg(th.accent).add_modifier(Modifier::BOLD))
         } else {
             (a.name.as_str(), Style::default().fg(th.secondary))
         };
-        let mut cells = vec![
-            Cell::from(a.pid.to_string()).style(Style::default().fg(th.text)),
-            Cell::from(truncate(name, name_w)).style(name_style),
-        ];
+        let mut cells = Vec::new();
         if !compact {
-            cells.push(Cell::from(truncate(&a.project, 18)).style(Style::default().fg(th.dim)));
+            cells.push(Cell::from(a.pid.to_string()).style(Style::default().fg(th.text)));
         }
+        cells.push(Cell::from(truncate(name, name_w)).style(name_style));
+        cells.push(Cell::from(truncate_left(&a.repo, repo_w)).style(Style::default().fg(th.dim)));
         if show_acc {
             cells.push(Cell::from(truncate(&a.account, 7)).style(Style::default().fg(th.dim)));
         }
-        cells.extend([
-            Cell::from(model_short(&a.model)).style(Style::default().fg(th.text)),
-            Cell::from(st),
-            Cell::from(theme::uptime(a.uptime_secs)).style(Style::default().fg(th.text)),
-        ]);
         if !compact {
-            cells.extend([
-                Cell::from(fmt_mem(a.rss_kb)).style(Style::default().fg(th.text)),
-                Cell::from(Span::styled(theme::spark(&a.burn_hist, 8), Style::default().fg(burn_color))),
-            ]);
+            cells.push(Cell::from(model_short(&a.model)).style(Style::default().fg(th.text)));
         }
-        cells.push(
-            Cell::from(theme::human(a.burn_tps.round() as u64))
-                .style(Style::default().fg(if busy { th.primary } else { th.text })),
-        );
+        cells.push(Cell::from(st));
+        if !compact {
+            cells.push(Cell::from(theme::uptime(a.uptime_secs)).style(Style::default().fg(th.text)));
+        }
+        cells.push(right(procs::fmt_cpu(a.cpu), cpu_color(th, a.cpu, sys.ncpu)));
+        cells.push(right(procs::fmt_kb(a.rss_kb), mem_color(th, a.rss_kb, sys.mem_total_kb)));
+        if show_gpu {
+            let (g, c) = match a.gpu {
+                Some(g) if g >= 50.0 => (format!("{g:.0}%"), th.crit),
+                Some(g) if g >= 1.0 => (format!("{g:.0}%"), th.warn),
+                Some(g) => (format!("{g:.0}%"), th.dim),
+                None => ("—".into(), th.dim),
+            };
+            cells.push(right(g, c));
+        }
+        if wide {
+            cells.push(Cell::from(Span::styled(theme::spark(&a.burn_hist, 8), Style::default().fg(burn_color))));
+        }
+        if !compact {
+            cells.push(
+                Cell::from(theme::human(a.burn_tps.round() as u64))
+                    .style(Style::default().fg(if busy { th.primary } else { th.text })),
+            );
+        }
         Row::new(cells)
     });
 
@@ -400,8 +641,9 @@ fn agents_table(f: &mut Frame, th: &Theme, area: Rect, agents: &[LiveAgent],
     f.render_stateful_widget(table, area, state);
 }
 
-/// Drill-down for the selected agent: session totals, cost, freshness.
-fn detail_panel(f: &mut Frame, th: &Theme, area: Rect, d: &AgentDetail) {
+/// Drill-down for the selected agent: what its process tree is doing to the
+/// machine, then session totals, cost and identity.
+fn detail_panel(f: &mut Frame, th: &Theme, area: Rect, d: &AgentDetail, sys: &SysStats) {
     let head = if d.name.is_empty() { &d.project } else { &d.name };
     // Borders plus the " ▶ " prefix and the trailing space.
     let head_w = area.width.saturating_sub(6) as usize;
@@ -412,10 +654,16 @@ fn detail_panel(f: &mut Frame, th: &Theme, area: Rect, d: &AgentDetail) {
     let block = panel(th, title);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    let w = inner.width as usize;
 
     let lbl = |s: &str| Span::styled(format!("{s:<8}"), Style::default().fg(th.dim));
     let busy = d.status == "busy";
-    let st_color = if busy { th.primary } else { th.dim };
+    let st_color = match d.status.as_str() {
+        "busy" => th.primary,
+        "orphan" => th.crit,
+        "unreg" => th.warn,
+        _ => th.dim,
+    };
     let idle = match d.idle_secs {
         Some(s) if s < 90 => format!("{s}s ago"),
         Some(s) => format!("{} ago", theme::until(s)),
@@ -423,20 +671,71 @@ fn detail_panel(f: &mut Frame, th: &Theme, area: Rect, d: &AgentDetail) {
     };
     let cache = d.tok.cache_read + d.tok.cache_write_5m + d.tok.cache_write_1h;
 
-    let lines = vec![
+    let mut lines = vec![
+        Line::from(vec![
+            lbl("state"),
+            Span::styled(d.status.clone(), Style::default().fg(st_color)),
+            Span::styled(format!(" · up {} · pid {}", theme::uptime(d.uptime_secs), d.pid),
+                Style::default().fg(th.dim)),
+        ]),
+        Line::from(vec![
+            lbl("load"),
+            Span::styled(procs::fmt_cores(d.cpu),
+                Style::default().fg(cpu_color(th, d.cpu, sys.ncpu)).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {}", procs::fmt_kb(d.rss_kb)),
+                Style::default().fg(mem_color(th, d.rss_kb, sys.mem_total_kb)).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                match d.gpu {
+                    Some(g) if d.gpu_mem_kb > 0 => format!(" gpu {g:.0}% {}", procs::fmt_kb(d.gpu_mem_kb)),
+                    Some(g) => format!(" gpu {g:.0}%"),
+                    None => String::new(),
+                },
+                Style::default().fg(th.text),
+            ),
+        ]),
+        Line::from(vec![
+            lbl("procs"),
+            Span::styled(d.nprocs.to_string(), Style::default().fg(th.text)),
+            Span::styled(
+                if d.detached > 0 { format!(" ({} detached)", d.detached) } else { String::new() },
+                Style::default().fg(th.warn),
+            ),
+        ]),
+    ];
+    // The processes doing the work, hottest first.
+    for p in d.top.iter().take(4) {
+        let place = place_tag(&p.place, &d.repo);
+        let cmd_w = w.saturating_sub(14 + place.chars().count());
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:>5}", procs::fmt_cpu(p.cpu)), Style::default().fg(cpu_color(th, p.cpu, sys.ncpu))),
+            Span::styled(format!(" {:>6} ", procs::fmt_kb(p.rss_kb)), Style::default().fg(th.dim)),
+            Span::styled(
+                match p.gpu {
+                    Some(g) if g >= 1.0 => format!("g{g:.0}% "),
+                    _ => String::new(),
+                },
+                Style::default().fg(th.warn),
+            ),
+            Span::styled(place, Style::default().fg(th.secondary)),
+            Span::styled(truncate(&p.cmd, cmd_w), Style::default().fg(th.text)),
+        ]));
+    }
+    if !d.title.is_empty() && d.title != d.name {
+        lines.push(Line::from(vec![lbl("title"), Span::styled(truncate(&d.title, w.saturating_sub(8)), Style::default().fg(th.text))]));
+    }
+    lines.push(Line::from(vec![
+        lbl("repo"),
+        Span::styled(truncate_left(&d.repo, w.saturating_sub(8)), Style::default().fg(th.secondary)),
+    ]));
+    lines.extend([
         Line::from(vec![
             lbl("model"),
             Span::styled(model_short(&d.model), Style::default().fg(th.text).add_modifier(Modifier::BOLD)),
         ]),
-        Line::from(vec![
-            lbl("state"),
-            Span::styled(d.status.clone(), Style::default().fg(st_color)),
-            Span::styled(format!(" · up {}", theme::uptime(d.uptime_secs)), Style::default().fg(th.dim)),
-        ]),
         Line::from(vec![lbl("active"), Span::styled(idle, Style::default().fg(th.text))]),
         Line::from(vec![
             lbl("burn"),
-            Span::styled(theme::spark(&d.burn_hist, 8), Style::default().fg(st_color)),
+            Span::styled(theme::spark(&d.burn_hist, 8), Style::default().fg(if busy { th.primary } else { th.dim })),
             Span::styled(format!(" {} tok/s", theme::human(d.burn_tps.round() as u64)),
                 Style::default().fg(th.text)),
         ]),
@@ -457,16 +756,16 @@ fn detail_panel(f: &mut Frame, th: &Theme, area: Rect, d: &AgentDetail) {
             lbl("account"),
             Span::styled(d.account.clone(), Style::default().fg(th.secondary)),
             Span::styled(
-                format!("  {}", d.session_id.chars().take(8).collect::<String>()),
+                format!("  {} {}", d.handle, d.session_id.chars().take(8).collect::<String>()),
                 Style::default().fg(th.dim),
             ),
         ]),
         Line::from(vec![
             lbl("cwd"),
-            Span::styled(truncate_left(&d.cwd, inner.width.saturating_sub(9) as usize),
+            Span::styled(truncate_left(&d.cwd, w.saturating_sub(9)),
                 Style::default().fg(th.dim)),
         ]),
-    ];
+    ]);
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -598,16 +897,20 @@ fn footer(f: &mut Frame, th: &Theme, area: Rect, plans: &[PlanView], n_sources: 
     f.render_widget(Paragraph::new(Line::from(spans)).alignment(Alignment::Left), area);
 }
 
-fn model_short(m: &str) -> String {
-    m.strip_prefix("claude-").unwrap_or(m).to_string()
+/// Where a process runs, relative to its agent: empty when it's the agent's
+/// own folder, otherwise the part of the repo label that differs
+/// (`wt-mt-1-5/backend `), with a trailing space for layout.
+pub fn place_tag(place: &str, agent_repo: &str) -> String {
+    if place.is_empty() || place == agent_repo {
+        return String::new();
+    }
+    let repo = agent_repo.split('/').next().unwrap_or("");
+    let rel = place.strip_prefix(repo).and_then(|r| r.strip_prefix('/')).unwrap_or(place);
+    format!("{rel} ")
 }
 
-fn fmt_mem(kb: u64) -> String {
-    if kb >= 1024 * 1024 {
-        format!("{:.1}G", kb as f64 / 1024.0 / 1024.0)
-    } else {
-        format!("{}M", kb / 1024)
-    }
+fn model_short(m: &str) -> String {
+    m.strip_prefix("claude-").unwrap_or(m).to_string()
 }
 
 fn truncate(s: &str, max: usize) -> String {

@@ -4,6 +4,7 @@
 use chrono::{Duration, Utc};
 
 use crate::account::Account;
+use crate::procs::{GpuStats, ProcLine, SysStats};
 use crate::model::{AgentDetail, PlanView, ScopedWindow, Spend, Tokens, UsageSource, UsageWindows, Window};
 use crate::sessions::LiveAgent;
 use crate::transcripts::Aggregates;
@@ -81,6 +82,15 @@ pub fn agents(tick: u64) -> Vec<LiveAgent> {
         session_id: String::new(),
         name: name.trim_end_matches('*').into(),
         named: name.ends_with('*'),
+        title: name.trim_end_matches('*').into(),
+        handle: format!("{project}-a4"),
+        repo: if project == "web-frontend" { "web/checkout-wt".into() } else { project.into() },
+        cpu: 0.0,
+        gpu: Some(0.0),
+        gpu_mem_kb: 0,
+        nprocs: 3,
+        detached: 0,
+        top: Vec::new(),
         project: project.into(),
         account: "ada".into(),
         cwd: format!("/home/ada/dev/{project}"),
@@ -92,7 +102,7 @@ pub fn agents(tick: u64) -> Vec<LiveAgent> {
         burn_hist: hist,
         kind: "interactive".into(),
     };
-    vec![
+    let mut v = vec![
         a(48213, "rate-limit-fix*", "api-gateway", "claude-fable-5", "busy", 264, 345,
             78.0 + (tick % 7) as f64, roll(&[40, 58, 72, 61, 84, 76, 91, 80], tick)),
         a(47190, "checkout-redesign*", "web-frontend", "claude-sonnet-4-6", "busy", 743, 410,
@@ -100,13 +110,77 @@ pub fn agents(tick: u64) -> Vec<LiveAgent> {
         a(46055, "data-pipeline-7b", "data-pipeline", "claude-opus-4-8", "idle", 4080, 467, 0.0, vec![1, 1, 2, 1, 1, 1, 2, 1]),
         a(44820, "infra-terraform-2c", "infra-terraform", "claude-haiku-4-5", "idle", 13260, 388, 0.0, vec![1; 8]),
         a(43771, "docs-site-e4", "docs-site", "claude-opus-4-8", "shell", 22320, 502, 0.0, vec![1; 8]),
-    ]
+    ];
+    // Resource load: the redesign agent is running a test suite and a
+    // headless browser; one idle agent left a dev server spinning.
+    let load = [(118.0, 96, 6, 2u64), (372.0, 2140, 14, 31), (8.0, 610, 4, 0), (1.0, 402, 2, 0), (64.0, 890, 5, 0)];
+    for (ag, (cpu, mem_mb, n, gpu)) in v.iter_mut().zip(load) {
+        ag.cpu = cpu + (tick % 9) as f32;
+        ag.rss_kb = mem_mb * 1024;
+        ag.nprocs = n;
+        ag.gpu = Some(gpu as f32);
+        ag.top = demo_top(ag.pid, ag.cpu, ag.rss_kb, &ag.project);
+    }
+    v
+}
+
+fn demo_top(pid: i32, cpu: f32, rss_kb: u64, project: &str) -> Vec<ProcLine> {
+    let p = |off: i32, share: f32, mem: f32, cmd: &str| ProcLine {
+        pid: pid + off,
+        cpu: cpu * share,
+        rss_kb: (rss_kb as f32 * mem) as u64,
+        gpu: None,
+        cmd: cmd.into(),
+        place: String::new(),
+    };
+    match project {
+        "web-frontend" => vec![
+            p(212, 0.48, 0.30, "node vitest run --threads"),
+            p(305, 0.31, 0.38, "chrome --headless=new"),
+            p(0, 0.12, 0.18, "claude"),
+        ],
+        "docs-site" => vec![p(88, 0.92, 0.40, "node next dev"), p(0, 0.05, 0.50, "claude")],
+        _ => vec![p(0, 0.85, 0.7, "claude"), p(41, 0.10, 0.2, "zsh")],
+    }
+}
+
+pub fn sys() -> SysStats {
+    SysStats {
+        cpu: 38.0,
+        ncpu: 16,
+        load: (6.2, 5.1, 4.4),
+        mem_used_kb: 19_400 * 1024,
+        mem_total_kb: 32_000 * 1024,
+        swap_used_kb: 1_200 * 1024,
+        swap_total_kb: 8_000 * 1024,
+        psi_cpu: Some(4.0),
+        psi_mem: Some(0.0),
+        psi_io: Some(1.0),
+        gpu: Some(GpuStats {
+            busy: Some(31.0),
+            vram_used_kb: 2_900 * 1024,
+            vram_total_kb: 8_000 * 1024,
+            gtt_used_kb: 0,
+            gtt_total_kb: 0,
+        }),
+    }
 }
 
 /// Authored drill-down stats for a demo agent (no transcript store to join).
 pub fn detail(a: &LiveAgent) -> AgentDetail {
     let busy = a.status == "busy";
     AgentDetail {
+        pid: a.pid,
+        handle: a.handle.clone(),
+        title: a.title.clone(),
+        repo: a.repo.clone(),
+        cpu: a.cpu,
+        rss_kb: a.rss_kb,
+        gpu: a.gpu,
+        gpu_mem_kb: a.gpu_mem_kb,
+        nprocs: a.nprocs,
+        detached: a.detached,
+        top: a.top.clone(),
         name: a.name.clone(),
         project: a.project.clone(),
         account: a.account.clone(),

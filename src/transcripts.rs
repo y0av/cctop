@@ -8,6 +8,7 @@ use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime};
 
 use chrono::DateTime;
 use serde_json::Value;
@@ -28,47 +29,184 @@ pub struct Record {
 
 struct FileState {
     offset: u64,
+    /// Last modification seen; files untouched for `HOT_SECS` drop out of the
+    /// per-tick check.
+    mtime: SystemTime,
 }
+
+/// Files modified this recently are re-checked every tick.
+const HOT_SECS: u64 = 600;
+/// Every this often, stat every file anyway: the safety net for a cold file
+/// that starts growing without its session being live (rare).
+const FULL_SWEEP_SECS: u64 = 60;
 
 pub struct Store {
     roots: Vec<PathBuf>,
     files: HashMap<PathBuf, FileState>,
+    /// Directory -> mtime. A new file (new session, new subagent) changes its
+    /// directory's mtime, so watching ~hundreds of dirs finds new transcripts
+    /// without stat'ing tens of thousands of files.
+    dirs: HashMap<PathBuf, SystemTime>,
+    /// Files re-checked every tick: recently modified ones.
+    hot: HashSet<PathBuf>,
+    /// Transcript files by stem, so a live (e.g. resumed) session's cold file
+    /// is checked every tick too.
+    by_stem: HashMap<String, Vec<PathBuf>>,
+    last_sweep: Option<Instant>,
     seen: HashSet<u64>,
     pub records: Vec<Record>,
     /// session id -> (latest ts, model) for joining live agents to their model.
     pub session_model: HashMap<String, (i64, String)>,
+    /// session id -> (priority, title). A title you set beats the generated
+    /// one; within a priority the latest line wins.
+    pub session_title: HashMap<String, (u8, String)>,
 }
+
+/// Title priorities: Claude's generated title < an agent name < `/rename`.
+pub const TITLE_AI: u8 = 1;
+pub const TITLE_AGENT: u8 = 2;
+pub const TITLE_CUSTOM: u8 = 3;
 
 impl Store {
     pub fn new(roots: Vec<PathBuf>) -> Self {
         Store {
             roots,
             files: HashMap::new(),
+            dirs: HashMap::new(),
+            hot: HashSet::new(),
+            by_stem: HashMap::new(),
+            last_sweep: None,
             seen: HashSet::new(),
             records: Vec::new(),
             session_model: HashMap::new(),
+            session_title: HashMap::new(),
         }
     }
 
-    /// Walk every projects tree and ingest any newly-appended bytes. Per-file
-    /// offsets and the dedup set are keyed globally, so overlapping roots (or a
-    /// file reachable from two roots) are counted exactly once.
-    pub fn refresh(&mut self) {
-        let mut paths = Vec::new();
-        for root in &self.roots {
-            collect_jsonl(root, &mut paths);
+    /// Ingest newly-appended bytes. Per-file offsets and the dedup set are
+    /// keyed globally, so overlapping roots (or a file reachable from two
+    /// roots) are counted exactly once.
+    ///
+    /// Cost: a full sweep (walk + stat every file) runs on the first call and
+    /// then once a minute. Every other tick stats only the directories, the
+    /// recently modified files, and the files of `live_sessions`.
+    pub fn refresh(&mut self, live_sessions: &[String]) {
+        let sweep = self
+            .last_sweep
+            .map(|t| t.elapsed().as_secs() >= FULL_SWEEP_SECS)
+            .unwrap_or(true);
+        if sweep {
+            self.full_sweep();
+            self.last_sweep = Some(Instant::now());
+            return;
         }
-        for path in paths {
-            if let Err(_e) = self.ingest_file(&path) {
-                // A transient read error (file rotated mid-read) just means we
-                // retry next refresh; never fatal.
+
+        // New files: re-list only directories whose mtime moved.
+        let changed: Vec<PathBuf> = self
+            .dirs
+            .iter()
+            .filter(|(d, m)| std::fs::metadata(d).and_then(|md| md.modified()).ok() != Some(**m))
+            .map(|(d, _)| d.clone())
+            .collect();
+        for d in changed {
+            let mut found = Vec::new();
+            self.list_dir(&d, &mut found, false);
+            for p in found {
+                if !self.files.contains_key(&p) {
+                    self.hot.insert(p);
+                }
+            }
+        }
+
+        let mut check: Vec<PathBuf> = self.hot.iter().cloned().collect();
+        for sid in live_sessions {
+            if let Some(ps) = self.by_stem.get(sid) {
+                check.extend(ps.iter().filter(|p| !self.hot.contains(*p)).cloned());
+            }
+        }
+        let now = SystemTime::now();
+        for path in check {
+            match std::fs::metadata(&path) {
+                Ok(md) => {
+                    let mtime = md.modified().unwrap_or(now);
+                    // A transient read error (file rotated mid-read) just means
+                    // we retry next refresh; never fatal.
+                    let _ = self.ingest_file(&path, md.len(), mtime);
+                    let cold = now.duration_since(mtime).map(|d| d.as_secs() > HOT_SECS).unwrap_or(false);
+                    if cold {
+                        self.hot.remove(&path);
+                    } else {
+                        self.hot.insert(path);
+                    }
+                }
+                Err(_) => {
+                    self.hot.remove(&path);
+                }
             }
         }
     }
 
-    fn ingest_file(&mut self, path: &Path) -> std::io::Result<()> {
-        let len = std::fs::metadata(path)?.len();
-        let state = self.files.entry(path.to_path_buf()).or_insert(FileState { offset: 0 });
+    /// Walk every root, stat every transcript, ingest what grew, and rebuild
+    /// the directory and hot-file sets.
+    fn full_sweep(&mut self) {
+        let mut paths = Vec::new();
+        self.dirs.clear();
+        for root in self.roots.clone() {
+            self.list_dir(&root, &mut paths, true);
+        }
+        let now = SystemTime::now();
+        self.hot.clear();
+        for path in paths {
+            let Ok(md) = std::fs::metadata(&path) else { continue };
+            let mtime = md.modified().unwrap_or(now);
+            let _ = self.ingest_file(&path, md.len(), mtime);
+            if now.duration_since(mtime).map(|d| d.as_secs() <= HOT_SECS).unwrap_or(true) {
+                self.hot.insert(path);
+            }
+        }
+    }
+
+    /// List `dir` (recursing into subdirectories when `recurse`, or when a
+    /// subdirectory is new to us), recording directory mtimes and pushing every
+    /// `.jsonl` path. Uses the entry's file type, which costs no extra stat.
+    fn list_dir(&mut self, dir: &Path, out: &mut Vec<PathBuf>, recurse: bool) {
+        let Ok(md) = std::fs::metadata(dir) else {
+            self.dirs.remove(dir);
+            return;
+        };
+        if let Ok(m) = md.modified() {
+            self.dirs.insert(dir.to_path_buf(), m);
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            let is_dir = if ft.is_symlink() { p.is_dir() } else { ft.is_dir() };
+            if is_dir {
+                if recurse || !self.dirs.contains_key(&p) {
+                    self.list_dir(&p, out, true);
+                }
+            } else if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    let v = self.by_stem.entry(stem.to_string()).or_default();
+                    if !v.contains(&p) {
+                        v.push(p.clone());
+                    }
+                }
+                out.push(p);
+            }
+        }
+    }
+
+    fn ingest_file(&mut self, path: &Path, len: u64, mtime: SystemTime) -> std::io::Result<()> {
+        let state = self
+            .files
+            .entry(path.to_path_buf())
+            .or_insert(FileState { offset: 0, mtime });
+        state.mtime = mtime;
         if len < state.offset {
             // File was truncated/rotated — start over.
             state.offset = 0;
@@ -98,7 +236,7 @@ impl Store {
         // Re-borrow: `reader` held `f`; update offset after the loop.
         self.files
             .entry(path.to_path_buf())
-            .or_insert(FileState { offset: 0 })
+            .or_insert(FileState { offset: 0, mtime })
             .offset = consumed;
         Ok(())
     }
@@ -108,7 +246,25 @@ impl Store {
             Ok(v) => v,
             Err(_) => return,
         };
-        if v.get("type").and_then(Value::as_str) != Some("assistant") {
+        let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
+        let title = match kind {
+            "custom-title" => Some((TITLE_CUSTOM, "customTitle")),
+            "agent-name" => Some((TITLE_AGENT, "agentName")),
+            "ai-title" => Some((TITLE_AI, "aiTitle")),
+            _ => None,
+        };
+        if let Some((prio, field)) = title {
+            let session = v.get("sessionId").and_then(Value::as_str).unwrap_or("");
+            let text = v.get(field).and_then(Value::as_str).unwrap_or("").trim();
+            if !session.is_empty() && !text.is_empty() {
+                let e = self.session_title.entry(session.to_string()).or_insert((0, String::new()));
+                if prio >= e.0 {
+                    *e = (prio, text.to_string());
+                }
+            }
+            return;
+        }
+        if kind != "assistant" {
             return;
         }
         let msg = match v.get("message") {
@@ -330,17 +486,3 @@ pub fn project_name(cwd: &str) -> &str {
     cwd.trim_end_matches('/').rsplit('/').next().unwrap_or(cwd)
 }
 
-fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
-    let rd = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(_) => return,
-    };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            collect_jsonl(&p, out);
-        } else if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            out.push(p);
-        }
-    }
-}

@@ -15,6 +15,7 @@ pub fn html(width: u16, height: u16, th: &Theme, multi: bool) -> String {
     let account = demo::account();
     let agg = demo::aggregates();
     let agents = demo::agents(0);
+    let sys = demo::sys();
     let plans = if multi {
         demo::multi_plans()
     } else {
@@ -27,7 +28,7 @@ pub fn html(width: u16, height: u16, th: &Theme, multi: bool) -> String {
 
     let mut term = Terminal::new(TestBackend::new(width, height)).expect("test backend");
     term.draw(|f| {
-        ui::draw(f, th, &account, &agg, &agents, &plans, Some(&detail), &mut state, "burn",
+        ui::draw(f, th, &account, &agg, &agents, &plans, &sys, Some(&detail), &mut state, "burn",
                  n_sources, None)
     })
     .expect("draw");

@@ -4,6 +4,7 @@ mod account;
 mod demo;
 mod model;
 mod pricing;
+mod procs;
 mod sessions;
 mod snapshot;
 mod theme;
@@ -34,6 +35,7 @@ use ratatui::Terminal;
 
 use account::Account;
 use model::{AgentDetail, PlanView, ScopedWindow, Tokens, UsageSource, UsageWindows, Window};
+use procs::{Sampler, SysStats, TreeUsage};
 use sessions::LiveAgent;
 use transcripts::{Aggregates, Store};
 
@@ -81,23 +83,26 @@ struct Args {
 #[derive(Clone, Copy)]
 enum Sort {
     Burn,
-    Uptime,
+    Cpu,
     Mem,
+    Uptime,
 }
 
 impl Sort {
     fn label(self) -> &'static str {
         match self {
             Sort::Burn => "burn",
-            Sort::Uptime => "up",
+            Sort::Cpu => "cpu",
             Sort::Mem => "mem",
+            Sort::Uptime => "up",
         }
     }
     fn next(self) -> Sort {
         match self {
-            Sort::Burn => Sort::Uptime,
-            Sort::Uptime => Sort::Mem,
-            Sort::Mem => Sort::Burn,
+            Sort::Burn => Sort::Cpu,
+            Sort::Cpu => Sort::Mem,
+            Sort::Mem => Sort::Uptime,
+            Sort::Uptime => Sort::Burn,
         }
     }
 }
@@ -190,6 +195,8 @@ struct App {
     account: Account,
     agg: Aggregates,
     agents: Vec<LiveAgent>,
+    sampler: Sampler,
+    sys: SysStats,
     slots: Vec<PlanSlot>,
     plans: Vec<PlanView>,
     table: TableState,
@@ -215,14 +222,32 @@ impl App {
                 self.table.select(Some(0));
             }
             self.agents = agents;
+            self.sys = demo::sys();
             self.tick = self.tick.wrapping_add(1);
             self.recompute_usage();
             return;
         }
-        self.store.refresh();
+        // Last tick's live sessions: their transcripts are checked every tick
+        // even when cold (a `--resume` appends to an old file).
+        let live: Vec<String> = self.agents.iter().map(|a| a.session_id.clone()).collect();
+        self.store.refresh(&live);
+        self.sampler.refresh();
         let (now_s, now_ms, today) = now_parts();
         self.agg = self.store.aggregate(now_s, today);
-        let mut agents = sessions::read(&self.sessions_dirs, &self.store, now_ms);
+        let (mut agents, stale) = sessions::read(&self.sessions_dirs, &self.store, now_ms, &self.sampler);
+        let roots: Vec<i32> = agents.iter().map(|a| a.pid).collect();
+        let sample = self.sampler.attribute(&roots);
+        for a in agents.iter_mut() {
+            if let Some(t) = sample.trees.get(&a.pid) {
+                apply_usage(a, t);
+            }
+        }
+        for s in sample.strays {
+            if let Some(a) = stray_agent(s, &stale) {
+                agents.push(a);
+            }
+        }
+        self.sys = sample.sys;
         apply_sort(&mut agents, self.sort);
         let len = agents.len();
         self.agents = agents;
@@ -332,6 +357,17 @@ impl App {
             .get(&a.session_id)
             .map(|(ts, _)| (Local::now().timestamp() - ts).max(0));
         Some(AgentDetail {
+            pid: a.pid,
+            handle: a.handle.clone(),
+            title: a.title.clone(),
+            repo: a.repo.clone(),
+            cpu: a.cpu,
+            rss_kb: a.rss_kb,
+            gpu: a.gpu,
+            gpu_mem_kb: a.gpu_mem_kb,
+            nprocs: a.nprocs,
+            detached: a.detached,
+            top: a.top.clone(),
             name: a.name.clone(),
             project: a.project.clone(),
             account: a.account.clone(),
@@ -462,7 +498,7 @@ fn main() {
     };
 
     if let Some(path) = &args.snapshot {
-        let height = if args.snapshot_multi { 31 } else { 27 };
+        let height = if args.snapshot_multi { 33 } else { 29 };
         std::fs::write(path, snapshot::html(100, height, &theme::THEMES[theme_idx], args.snapshot_multi))
             .expect("write snapshot html");
         return;
@@ -486,6 +522,8 @@ fn main() {
         account: account::read_account(&base),
         agg: empty_aggregates(),
         agents: Vec::new(),
+        sampler: Sampler::new(),
+        sys: SysStats::default(),
         slots,
         plans: Vec::new(),
         table: TableState::default(),
@@ -499,6 +537,11 @@ fn main() {
         tx: tx.clone(),
     };
     app.refresh();
+    if args.once && !args.demo {
+        // CPU percentages are deltas between two samples.
+        std::thread::sleep(Duration::from_millis(600));
+        app.refresh();
+    }
 
     let check_updates = !args.no_net && !args.demo && !args.no_update_check && !update::disabled_by_env();
 
@@ -585,8 +628,8 @@ fn run_tui(app: &mut App, rx: &mpsc::Receiver<NetMsg>, refresh_ms: u64) -> std::
         let th = &theme::THEMES[app.theme_idx];
         let update = app.update.clone();
         term.draw(|f| {
-            ui::draw(f, th, &app.account, &app.agg, &app.agents, &app.plans, detail.as_ref(),
-                     &mut app.table, sort_label, n_sources, update.as_deref())
+            ui::draw(f, th, &app.account, &app.agg, &app.agents, &app.plans, &app.sys,
+                     detail.as_ref(), &mut app.table, sort_label, n_sources, update.as_deref())
         })?;
 
         let timeout = tick.saturating_sub(last.elapsed());
@@ -665,8 +708,90 @@ fn apply_sort(agents: &mut [LiveAgent], sort: Sort) {
                 .then(b.uptime_secs.cmp(&a.uptime_secs))
         }),
         Sort::Uptime => agents.sort_by(|a, b| busy_first(a, b).then(b.uptime_secs.cmp(&a.uptime_secs))),
-        Sort::Mem => agents.sort_by(|a, b| busy_first(a, b).then(b.rss_kb.cmp(&a.rss_kb))),
+        // Resource sorts ignore busy/idle: an "idle" agent can still have a
+        // runaway dev server or test run burning the machine.
+        Sort::Cpu => agents.sort_by(|a, b| {
+            b.cpu.partial_cmp(&a.cpu).unwrap_or(Ordering::Equal).then(b.rss_kb.cmp(&a.rss_kb))
+        }),
+        Sort::Mem => agents.sort_by(|a, b| b.rss_kb.cmp(&a.rss_kb)),
     }
+}
+
+fn apply_usage(a: &mut LiveAgent, t: &TreeUsage) {
+    a.cpu = t.cpu;
+    a.rss_kb = t.rss_kb;
+    a.gpu = t.gpu;
+    a.gpu_mem_kb = t.gpu_mem_kb;
+    a.nprocs = t.nprocs;
+    a.detached = t.detached;
+    a.top = t.top.clone();
+}
+
+/// A row for processes whose `CLAUDE_PID` isn't a live registered session:
+/// orphans of a dead session, or children of a claude cctop has no session
+/// file for. Orphans always show (they are leaks); live-but-unregistered ones
+/// only when they're using something.
+fn stray_agent(s: procs::Stray, stale: &std::collections::HashMap<i32, LiveAgent>) -> Option<LiveAgent> {
+    let busy = s.usage.cpu >= 1.0 || s.usage.rss_kb >= 100 * 1024;
+    if s.owner_alive && !busy {
+        return None;
+    }
+    let status = if s.owner_alive { "unreg" } else { "orphan" };
+    let mut a = match stale.get(&s.claude_pid) {
+        Some(st) => LiveAgent {
+            pid: st.pid,
+            session_id: st.session_id.clone(),
+            name: st.name.clone(),
+            named: st.named,
+            title: st.title.clone(),
+            handle: st.handle.clone(),
+            project: st.project.clone(),
+            repo: st.repo.clone(),
+            account: st.account.clone(),
+            cwd: st.cwd.clone(),
+            model: st.model.clone(),
+            status: String::new(),
+            uptime_secs: 0,
+            rss_kb: 0,
+            cpu: 0.0,
+            gpu: None,
+            gpu_mem_kb: 0,
+            nprocs: 0,
+            detached: 0,
+            top: Vec::new(),
+            burn_tps: 0.0,
+            burn_hist: vec![0; 8],
+            kind: String::new(),
+        },
+        None => LiveAgent {
+            pid: s.claude_pid,
+            session_id: String::new(),
+            name: format!("claude {}", s.claude_pid),
+            named: false,
+            title: String::new(),
+            handle: String::new(),
+            project: transcripts::project_name(&s.cwd).to_string(),
+            repo: sessions::repo_label(&s.cwd),
+            account: String::new(),
+            cwd: s.cwd.clone(),
+            model: "—".into(),
+            status: String::new(),
+            uptime_secs: 0,
+            rss_kb: 0,
+            cpu: 0.0,
+            gpu: None,
+            gpu_mem_kb: 0,
+            nprocs: 0,
+            detached: 0,
+            top: Vec::new(),
+            burn_tps: 0.0,
+            burn_hist: vec![0; 8],
+            kind: String::new(),
+        },
+    };
+    a.status = status.to_string();
+    apply_usage(&mut a, &s.usage);
+    Some(a)
 }
 
 fn estimate(agg: &Aggregates, note: Option<String>) -> UsageWindows {
@@ -757,6 +882,9 @@ fn print_once(app: &App) {
     }
 
     println!();
+    print_sys(&app.sys);
+
+    println!();
     if app.n_sources > 1 {
         println!("LIVE AGENTS ({} running · {} config dirs)", app.agents.len(), app.n_sources);
     } else {
@@ -771,20 +899,36 @@ fn print_once(app: &App) {
         .max()
         .unwrap_or(4)
         .clamp(4, 44);
-    println!("  {:<8} {:<name_w$} {:<18} {:<11} {:<6} {:>8} {:>8} {:>8}",
-        "PID", "NAME", "PROJECT", "MODEL", "ST", "UP", "MEM", "tok/s");
+    let repo_w = app.agents.iter().map(|a| a.repo.chars().count()).max().unwrap_or(4).clamp(4, 30);
+    println!("  {:<8} {:<name_w$} {:<repo_w$} {:<11} {:<6} {:>8} {:>6} {:>6} {:>5} {:>5} {:>6}",
+        "PID", "SESSION", "REPO", "MODEL", "ST", "UP", "CORES", "MEM", "GPU", "PROCS", "tok/s");
     for ag in &app.agents {
         println!(
-            "  {:<8} {:<name_w$} {:<18} {:<11} {:<6} {:>8} {:>7}M {:>8}",
+            "  {:<8} {:<name_w$} {:<repo_w$} {:<11} {:<6} {:>8} {:>6} {:>6} {:>5} {:>5} {:>6}",
             ag.pid,
             short(if ag.name.is_empty() { &ag.project } else { &ag.name }, name_w),
-            short(&ag.project, 18),
+            short(&ag.repo, repo_w),
             ag.model.strip_prefix("claude-").unwrap_or(&ag.model),
             ag.status,
             theme::uptime(ag.uptime_secs),
-            ag.rss_kb / 1024,
+            procs::fmt_cpu(ag.cpu),
+            procs::fmt_kb(ag.rss_kb),
+            ag.gpu.map(|g| format!("{g:.0}%")).unwrap_or_else(|| "—".into()),
+            ag.nprocs,
             theme::human(ag.burn_tps.round() as u64),
         );
+    }
+    // Where the load is: the hottest processes of the top agents.
+    let mut hot: Vec<&LiveAgent> = app.agents.iter().filter(|a| a.cpu >= 5.0).collect();
+    hot.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(Ordering::Equal));
+    for ag in hot.iter().take(3) {
+        println!();
+        println!("  {} ({}) — {}, {} across {} procs",
+            ag.name, ag.pid, procs::fmt_cores(ag.cpu), procs::fmt_kb(ag.rss_kb), ag.nprocs);
+        for p in ag.top.iter().take(4) {
+            println!("    {:>8} {:>6} {:>6}  {}{}", p.pid, procs::fmt_cpu(p.cpu), procs::fmt_kb(p.rss_kb),
+                ui::place_tag(&p.place, &ag.repo), short(&p.cmd, 70));
+        }
     }
 
     println!();
@@ -805,6 +949,28 @@ fn print_once(app: &App) {
     println!("BY PROJECT");
     for (p, tok, cost) in g.by_project.iter().take(8) {
         println!("  {:<24} {:>8}  ${:.2}", short(p, 24), theme::human(*tok), cost);
+    }
+}
+
+fn print_sys(s: &SysStats) {
+    let opt = |v: Option<f32>| v.map(|v| format!("{v:.0}%")).unwrap_or_else(|| "—".into());
+    println!(
+        "SYSTEM  cpu {:.0}% of {} cores  load {:.1} {:.1} {:.1}  mem {}/{}  swap {}/{}",
+        s.cpu, s.ncpu, s.load.0, s.load.1, s.load.2,
+        procs::fmt_kb(s.mem_used_kb), procs::fmt_kb(s.mem_total_kb),
+        procs::fmt_kb(s.swap_used_kb), procs::fmt_kb(s.swap_total_kb),
+    );
+    if s.psi_cpu.is_some() {
+        println!("  pressure (stalled, last 10s)  cpu {}  mem {}  io {}",
+            opt(s.psi_cpu), opt(s.psi_mem), opt(s.psi_io));
+    }
+    if let Some(g) = &s.gpu {
+        let mut line = format!("  gpu {}  vram {}/{}", opt(g.busy),
+            procs::fmt_kb(g.vram_used_kb), procs::fmt_kb(g.vram_total_kb));
+        if g.gtt_total_kb > 0 {
+            line.push_str(&format!("  gtt {}/{}", procs::fmt_kb(g.gtt_used_kb), procs::fmt_kb(g.gtt_total_kb)));
+        }
+        println!("{line}");
     }
 }
 

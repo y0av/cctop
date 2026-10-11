@@ -56,7 +56,8 @@ cctop
 
 - **Plan** — your live 5-hour and weekly limits (the same gauges as *claude.ai/settings/usage*) with reset timers, including the **per-model weekly caps** (Fable / Opus / Sonnet — whatever your plan enforces) and your **extra-usage credits** when overage is enabled. Falls back to a local estimate when offline.
 - **▲cap prediction** — cctop tracks how fast each window is climbing; if your current burn rate would hit 100% *before* the reset, the gauge grows a red `▲cap 58m` warning so you can throttle down (or switch models) in time.
-- **Live agents** — every running Claude Code session as a process row: session name, project, model, busy/idle, uptime, memory, and a live token-burn sparkline. Names track renames as they happen, and a name the agent or you chose is highlighted, so a session that renames itself to what it's working on stands out from the auto-derived `project-a4` default. Select a row (arrows, `j`/`k`, mouse wheel, or **click**) and the **drill-down panel** shows that session's totals: tokens in/out/cache, cost, last activity, working dir.
+- **System** — a strip under the header with machine CPU, memory, swap, GPU busy % and VRAM, and (Linux) pressure stalls: the share of the last 10 s that something waited on CPU, memory or IO. Below it, a diagnosis line names the hungriest agent and the process inside it doing the work (`▲ hottest hoteleak 11.8 cores ← python -c ← pytest`), plus warnings for thrashing, a saturated CPU, full swap and orphaned processes.
+- **Live agents** — every running Claude Code session as a process row: session title, repo (with the worktree or subfolder when it differs), model, busy/idle, uptime, and the **CPU (in cores, averaged over a few seconds), memory and GPU of its whole process tree**: the agent plus every shell, test runner, dev server and browser it started. On Linux, processes that escaped the tree are still traced back through the `CLAUDE_PID` variable Claude Code puts in their environment, and ones whose session has died show up as `†orph` rows. The title is the one Claude generated for the session, or what you set with `/rename`; a name you or the agent chose is highlighted. Select a row (arrows, `j`/`k`, mouse wheel, or **click**) and the **drill-down panel** shows the top processes (with Claude's shell wrapper unwrapped to the real command, and their folder), then the session totals: tokens in/out/cache, cost, last activity, working dir.
 - **Activity** — a 24-hour token column chart with today / 7-day / lifetime totals and cost, the main-vs-subagent split, and breakdowns by model and project.
 
 Token data is read locally from `~/.claude` (and any extra dirs you point it at — see [Multiple config dirs](#multiple-config-dirs)); the live plan gauges reuse your existing Claude Code OAuth login (Pro/Max). Nothing leaves your machine except the same usage request the CLI already makes.
@@ -65,7 +66,7 @@ Works on Linux, macOS and Windows.
 
 ## Keys & mouse
 
-`q` quit · `↑ ↓` select · `enter`/`d` toggle drill-down · `s` cycle sort · `t` cycle theme · `r` refresh
+`q` quit · `↑ ↓` select · `enter`/`d` toggle drill-down · `s` cycle sort (burn / cpu / mem / uptime) · `t` cycle theme · `r` refresh
 
 The mouse works too: **click** an agent row to select it, **scroll** to move the selection.
 

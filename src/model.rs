@@ -77,8 +77,22 @@ pub struct PlanView {
 
 /// Everything the drill-down panel shows about the selected agent.
 pub struct AgentDetail {
+    pub pid: i32,
     /// Session name; empty falls back to the project in the panel title.
     pub name: String,
+    /// Cwd-derived session handle and transcript title, when they differ
+    /// from `name`.
+    pub handle: String,
+    pub title: String,
+    pub repo: String,
+    /// Process-tree resource use (see `procs`).
+    pub cpu: f32,
+    pub rss_kb: u64,
+    pub gpu: Option<f32>,
+    pub gpu_mem_kb: u64,
+    pub nprocs: usize,
+    pub detached: usize,
+    pub top: Vec<crate::procs::ProcLine>,
     pub project: String,
     pub account: String,
     pub model: String,
