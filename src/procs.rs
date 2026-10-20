@@ -17,8 +17,12 @@ use std::time::Instant;
 
 use sysinfo::{
     CpuRefreshKind, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind,
-    System, UpdateKind,
+    Signal, System, UpdateKind,
 };
+
+/// Listening ports are re-scanned this often; it reads every fd of every
+/// process an agent owns.
+const PORTS_SECS: u64 = 3;
 
 /// One process inside an agent's tree, for the drill-down's "top" list.
 #[derive(Clone)]
@@ -50,6 +54,10 @@ pub struct TreeUsage {
     pub detached: usize,
     /// Hottest processes first (by CPU, then memory).
     pub top: Vec<ProcLine>,
+    /// Every member, for `x` on an orphan group.
+    pub pids: Vec<i32>,
+    /// TCP ports the tree listens on (Linux), sorted.
+    pub ports: Vec<u16>,
 }
 
 #[derive(Clone, Default)]
@@ -110,6 +118,9 @@ pub struct Sampler {
     /// Weight of the newest reading this tick (depends on tick length).
     alpha: f32,
     gpu: GpuProbe,
+    /// pid -> listening ports, from the last scan.
+    ports: HashMap<i32, Vec<u16>>,
+    ports_at: Option<Instant>,
 }
 
 impl Sampler {
@@ -127,6 +138,8 @@ impl Sampler {
             last_refresh: None,
             alpha: 1.0,
             gpu: GpuProbe::new(),
+            ports: HashMap::new(),
+            ports_at: None,
         }
     }
 
@@ -185,6 +198,17 @@ impl Sampler {
         self.sys.process(Pid::from_u32(pid as u32)).map(|p| p.memory() / 1024)
     }
 
+    /// Send SIGTERM (a plain terminate where signals don't exist) to each
+    /// pid; returns how many were signalled. Never touches init or cctop.
+    pub fn kill(&self, pids: &[i32]) -> usize {
+        let me = std::process::id() as i32;
+        pids.iter()
+            .filter(|&&p| p > 1 && p != me)
+            .filter_map(|&p| self.sys.process(Pid::from_u32(p as u32)))
+            .filter(|pr| pr.kill_with(Signal::Term).unwrap_or_else(|| pr.kill()))
+            .count()
+    }
+
     /// Charge every process to an agent (by parentage, then by `CLAUDE_PID`)
     /// and read the system-wide gauges.
     pub fn attribute(&mut self, roots: &[i32]) -> Sample {
@@ -239,6 +263,11 @@ impl Sampler {
         }
 
         let gpu_by_pid = self.gpu.per_process(owner.keys().copied());
+        if self.ports_at.is_none_or(|t| t.elapsed().as_secs() >= PORTS_SECS) {
+            let pids: Vec<i32> = owner.keys().copied().collect();
+            self.ports = listen_ports(&pids);
+            self.ports_at = Some(Instant::now());
+        }
 
         let mut groups: HashMap<i32, TreeUsage> = HashMap::new();
         for (&pid, &own) in &owner {
@@ -250,6 +279,10 @@ impl Sampler {
             g.cpu += cpu;
             g.rss_kb += rss;
             g.nprocs += 1;
+            g.pids.push(pid);
+            if let Some(ports) = self.ports.get(&pid) {
+                g.ports.extend(ports);
+            }
             if via_env.contains(&pid) {
                 g.detached += 1;
             }
@@ -274,6 +307,8 @@ impl Sampler {
                     .then(b.rss_kb.cmp(&a.rss_kb))
             });
             g.top.truncate(5);
+            g.ports.sort_unstable();
+            g.ports.dedup();
             for t in &mut g.top {
                 let cwd = proc_cwd(t.pid);
                 if !cwd.is_empty() {
@@ -413,6 +448,52 @@ fn claude_pid_of(pid: i32) -> Option<i32> {
 #[cfg(not(target_os = "linux"))]
 fn claude_pid_of(_pid: i32) -> Option<i32> {
     None
+}
+
+/// Listening TCP ports per pid: LISTEN sockets from /proc/net/tcp{,6} by
+/// inode, matched against each process's open fds.
+#[cfg(target_os = "linux")]
+fn listen_ports(pids: &[i32]) -> HashMap<i32, Vec<u16>> {
+    let mut by_inode: HashMap<u64, u16> = HashMap::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(txt) = std::fs::read_to_string(table) else { continue };
+        for line in txt.lines().skip(1) {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 10 || cols[3] != "0A" {
+                continue; // 0A = LISTEN
+            }
+            let port = cols[1].rsplit(':').next().and_then(|p| u16::from_str_radix(p, 16).ok());
+            if let (Some(port), Ok(inode)) = (port, cols[9].parse::<u64>()) {
+                if inode != 0 {
+                    by_inode.insert(inode, port);
+                }
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    if by_inode.is_empty() {
+        return out;
+    }
+    for &pid in pids {
+        let Ok(rd) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
+        let ports: Vec<u16> = rd
+            .flatten()
+            .filter_map(|e| std::fs::read_link(e.path()).ok())
+            .filter_map(|t| {
+                let t = t.to_str()?.strip_prefix("socket:[")?.strip_suffix(']')?.parse::<u64>().ok()?;
+                by_inode.get(&t).copied()
+            })
+            .collect();
+        if !ports.is_empty() {
+            out.insert(pid, ports);
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn listen_ports(_pids: &[i32]) -> HashMap<i32, Vec<u16>> {
+    HashMap::new()
 }
 
 #[cfg(target_os = "linux")]

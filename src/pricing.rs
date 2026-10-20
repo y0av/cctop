@@ -53,3 +53,35 @@ pub fn cost(model: &str, t: &Tokens) -> f64 {
         + t.cache_write_1h as f64 * write_1h)
         / 1_000_000.0
 }
+
+/// Context window of a model, in tokens. Opus and Sonnet from 4.6 on, every
+/// Haiku from 5 on and Fable/Mythos read 1M tokens; older models 200k. A
+/// session already holding more than the table allows was evidently started
+/// with a larger window (a `[1m]` variant), so `observed` wins.
+pub fn context_window(model: &str, observed: u64) -> u64 {
+    let m = model.split('[').next().unwrap_or(model).to_ascii_lowercase();
+    let at_least = |fam: &str, want: (u32, u32)| version_after(&m, fam).is_some_and(|v| v >= want);
+    let window = if m.contains("fable") || m.contains("mythos") {
+        1_000_000
+    } else if m.contains("opus") {
+        if at_least("opus", (4, 6)) { 1_000_000 } else { 200_000 }
+    } else if m.contains("sonnet") {
+        if at_least("sonnet", (4, 6)) { 1_000_000 } else { 200_000 }
+    } else if m.contains("haiku") {
+        if at_least("haiku", (5, 0)) { 1_000_000 } else { 200_000 }
+    } else {
+        200_000
+    };
+    if observed > window { 1_000_000.max(observed) } else { window }
+}
+
+/// `(major, minor)` from the digits after a family name: `opus-4-6` → (4, 6),
+/// `sonnet-4-20250514` → (4, 0) (an 8-digit date is not a minor version).
+/// None for the older `claude-3-5-sonnet` naming.
+fn version_after(m: &str, fam: &str) -> Option<(u32, u32)> {
+    let rest = &m[m.find(fam)? + fam.len()..];
+    let mut parts = rest.strip_prefix('-')?.split('-');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().filter(|p| p.len() <= 2).and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((major, minor))
+}

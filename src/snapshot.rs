@@ -25,11 +25,13 @@ pub fn html(width: u16, height: u16, th: &Theme, multi: bool) -> String {
     state.select(Some(0)); // highlight the top (busy) agent
     let detail = demo::detail(&agents[0]);
     let n_sources = if multi { 3 } else { 1 };
+    let panels = ui::Panels::default();
+    let series = demo::series(0, ui::graph_points(width, panels), 900);
 
     let mut term = Terminal::new(TestBackend::new(width, height)).expect("test backend");
     term.draw(|f| {
         ui::draw(f, th, &account, &agg, &agents, &plans, &sys, Some(&detail), &mut state, "burn",
-                 n_sources, None)
+                 n_sources, None, &series, panels, None)
     })
     .expect("draw");
     wrap(&buffer_to_pre(term.backend().buffer()))

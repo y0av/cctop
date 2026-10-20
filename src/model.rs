@@ -75,6 +75,54 @@ pub struct PlanView {
     pub usage: UsageWindows,
 }
 
+/// One tool call from a transcript, split for display: `Bash` + `cargo test`.
+#[derive(Clone)]
+pub struct ToolCall {
+    pub tool: String,
+    pub arg: String,
+    pub ts: i64,
+    /// Still waiting for its result: the agent is executing it right now.
+    pub pending: bool,
+}
+
+/// A subagent a session spawned, for the drill-down tree.
+#[derive(Clone)]
+pub struct SubAgentView {
+    /// Agent type (`Explore`, `general-purpose`…) and the task description.
+    pub kind: String,
+    pub desc: String,
+    pub tokens: u64,
+    pub running: bool,
+}
+
+/// Token throughput across every session, bucketed for the live graph.
+/// Rates are tokens per second, oldest bucket first.
+#[derive(Clone, Default)]
+pub struct Series {
+    /// Generated tokens (output).
+    pub out: Vec<f64>,
+    /// Context the model read: input plus cache reads and writes.
+    pub inp: Vec<f64>,
+    pub window_secs: i64,
+    /// Trailing-minute rates, for the panel titles.
+    pub out_now: f64,
+    pub inp_now: f64,
+    /// Totals over the whole window.
+    pub tok: u64,
+    pub cost: f64,
+}
+
+/// Working-tree state of the selected agent's repo.
+#[derive(Clone, Default)]
+pub struct GitStatus {
+    pub branch: String,
+    pub ahead: u32,
+    pub behind: u32,
+    /// Tracked files with changes, and untracked files.
+    pub changed: usize,
+    pub untracked: usize,
+}
+
 /// Everything the drill-down panel shows about the selected agent.
 pub struct AgentDetail {
     pub pid: i32,
@@ -106,6 +154,16 @@ pub struct AgentDetail {
     pub cost: f64,
     pub burn_tps: f64,
     pub burn_hist: Vec<u64>,
+    /// Context the last turn ran with, against the model's window.
+    pub ctx_tokens: u64,
+    pub ctx_window: u64,
+    pub compactions: u32,
+    /// The pending tool call, else the latest one.
+    pub action: Option<ToolCall>,
+    pub subagents: Vec<SubAgentView>,
+    /// TCP ports the process tree listens on.
+    pub ports: Vec<u16>,
+    pub git: Option<GitStatus>,
 }
 
 /// The full set of plan gauges shown in the header block.

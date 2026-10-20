@@ -265,6 +265,52 @@ pub fn columns(values: &[u64], width: usize, height: usize) -> Vec<String> {
     rows
 }
 
+/// Braille dots per cell column, from the baseline outward: bottom-up for a
+/// graph that grows upward, top-down for one that hangs from the top.
+const DOTS_UP: [[u32; 4]; 2] = [[0x40, 0x04, 0x02, 0x01], [0x80, 0x20, 0x10, 0x08]];
+const DOTS_DOWN: [[u32; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+
+/// A filled braille area graph, `width`×`height` cells, top row first: two
+/// samples per cell and four dot rows per line, so 2×width samples at
+/// 4×height levels. Values scale to `max`, are right-aligned (newest last),
+/// and any non-zero value shows at least one dot. `up` grows from the bottom
+/// edge; otherwise the graph hangs from the top (the lower half of a
+/// mirrored in/out graph).
+pub fn braille(values: &[f64], max: f64, width: usize, height: usize, up: bool) -> Vec<String> {
+    let n = width * 2;
+    let slice: &[f64] = if values.len() > n { &values[values.len() - n..] } else { values };
+    let pad = n - slice.len();
+    let dots = (height * 4) as f64;
+    let level = |i: usize| -> usize {
+        let v = if i < pad { 0.0 } else { slice[i - pad] };
+        if v <= 0.0 || max <= 0.0 { 0 } else { ((v / max).min(1.0) * dots).round().max(1.0) as usize }
+    };
+    let levels: Vec<usize> = (0..n).map(level).collect();
+    let table = if up { &DOTS_UP } else { &DOTS_DOWN };
+    (0..height)
+        .map(|r| {
+            // Dot rows already drawn by the lines nearer the baseline.
+            let below = if up { (height - 1 - r) * 4 } else { r * 4 };
+            (0..width)
+                .map(|c| {
+                    let bits: u32 = (0..2)
+                        .map(|side| {
+                            let fill = levels[2 * c + side].saturating_sub(below).min(4);
+                            table[side][..fill].iter().sum::<u32>()
+                        })
+                        .sum();
+                    if bits == 0 { ' ' } else { char::from_u32(0x2800 + bits).unwrap_or(' ') }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// A window length as a short label: 5m / 15m / 1h / 6h.
+pub fn span(secs: i64) -> String {
+    if secs >= 3600 && secs % 3600 == 0 { format!("{}h", secs / 3600) } else { format!("{}m", secs / 60) }
+}
+
 /// Compact dollar amount: $3.20 / $42 / $312 / $11.8k.
 pub fn money(v: f64) -> String {
     if v >= 10_000.0 {

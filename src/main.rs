@@ -2,6 +2,7 @@
 
 mod account;
 mod demo;
+mod git;
 mod model;
 mod pricing;
 mod procs;
@@ -34,7 +35,7 @@ use ratatui::widgets::TableState;
 use ratatui::Terminal;
 
 use account::Account;
-use model::{AgentDetail, PlanView, ScopedWindow, Tokens, UsageSource, UsageWindows, Window};
+use model::{AgentDetail, PlanView, ScopedWindow, Series, Tokens, UsageSource, UsageWindows, Window};
 use procs::{Sampler, SysStats, TreeUsage};
 use sessions::LiveAgent;
 use transcripts::{Aggregates, Store};
@@ -43,6 +44,12 @@ use transcripts::{Aggregates, Store};
 /// are not exposed). The token count shown is exact; the bar is illustrative.
 const EST_5H_BUDGET: u64 = 50_000_000;
 const EST_7D_BUDGET: u64 = 1_000_000_000;
+
+/// Token graph windows, cycled with `z`; the default is 15 minutes.
+const ZOOMS: [i64; 4] = [300, 900, 3600, 6 * 3600];
+const ZOOM_DEFAULT: usize = 1;
+/// How long a status message stays in the footer.
+const FLASH_SECS: u64 = 4;
 
 #[derive(Parser)]
 #[command(name = "cctop", version, about = "btop-style monitor for Claude usage & agents")]
@@ -105,6 +112,12 @@ impl Sort {
             Sort::Uptime => Sort::Burn,
         }
     }
+}
+
+/// A kill waiting for its y/n.
+struct Kill {
+    question: String,
+    pids: Vec<i32>,
 }
 
 enum NetMsg {
@@ -209,6 +222,11 @@ struct App {
     /// Newer release tag once the startup check has found one.
     update: Option<String>,
     tx: Sender<NetMsg>,
+    panels: ui::Panels,
+    /// Index into `ZOOMS`.
+    zoom: usize,
+    confirm: Option<Kill>,
+    flash: Option<(String, Instant)>,
 }
 
 impl App {
@@ -336,6 +354,61 @@ impl App {
         self.slots.iter().enumerate().map(|(i, s)| (i, s.creds_path.clone())).collect()
     }
 
+    /// Token throughput for the live graph, `points` samples wide.
+    fn series(&self, points: usize) -> Series {
+        let window = ZOOMS[self.zoom];
+        if self.demo {
+            return demo::series(self.tick, points, window);
+        }
+        self.store.token_series(Local::now().timestamp(), window, points)
+    }
+
+    fn flash(&mut self, msg: impl Into<String>) {
+        self.flash = Some((msg.into(), Instant::now()));
+    }
+
+    /// What the footer shows instead of key hints: a pending kill question,
+    /// else a recent status message.
+    fn notice(&self) -> Option<(String, bool)> {
+        if let Some(k) = &self.confirm {
+            return Some((k.question.clone(), true));
+        }
+        self.flash
+            .as_ref()
+            .filter(|(_, t)| t.elapsed() < Duration::from_secs(FLASH_SECS))
+            .map(|(m, _)| (m.clone(), false))
+    }
+
+    /// `x`: ask before signalling the selected row. A running claude (a
+    /// registered agent or an unregistered one) gets only its own process
+    /// terminated; children that outlive it then show up as orphans. Only an
+    /// orphan group, whose session is already dead, loses every member.
+    fn ask_kill(&mut self) {
+        let Some(a) = self.table.selected().and_then(|i| self.agents.get(i)) else { return };
+        if self.demo {
+            self.flash("demo mode: nothing to kill");
+            return;
+        }
+        let name = if a.name.is_empty() { &a.project } else { &a.name };
+        let procs = |n: usize| if n == 1 { "1 process".to_string() } else { format!("{n} processes") };
+        let (pids, what) = match a.status.as_str() {
+            "orphan" => (a.pids.clone(), format!("{} left by a dead session", procs(a.pids.len()))),
+            _ => (vec![a.pid], format!("claude pid {}", a.pid)),
+        };
+        if pids.is_empty() {
+            return;
+        }
+        self.confirm = Some(Kill {
+            question: format!("send SIGTERM to {} ({what})?  y = yes, any other key cancels", short(name, 30)),
+            pids,
+        });
+    }
+
+    fn do_kill(&mut self, k: Kill) {
+        let n = self.sampler.kill(&k.pids);
+        self.flash(format!("SIGTERM sent to {n} of {}", if k.pids.len() == 1 { "1 process".to_string() } else { format!("{} processes", k.pids.len()) }));
+    }
+
     /// Drill-down stats for the selected agent, joined from the transcript
     /// store (session totals, cost, last-activity).
     fn selected_detail(&self) -> Option<AgentDetail> {
@@ -381,6 +454,21 @@ impl App {
             cost,
             burn_tps: a.burn_tps,
             burn_hist: a.burn_hist.clone(),
+            ctx_tokens: a.ctx_tokens,
+            ctx_window: a.ctx_window,
+            compactions: a.compactions,
+            action: a.action.clone(),
+            subagents: self
+                .store
+                .sessions
+                .get(&a.session_id)
+                .map(|s| {
+                    let now = Local::now().timestamp();
+                    s.subagents(now, now - a.uptime_secs)
+                })
+                .unwrap_or_default(),
+            ports: a.ports.clone(),
+            git: git::status(&a.cwd),
         })
     }
 
@@ -535,6 +623,10 @@ fn main() {
         tick: 0,
         update: None,
         tx: tx.clone(),
+        panels: ui::Panels::default(),
+        zoom: ZOOM_DEFAULT,
+        confirm: None,
+        flash: None,
     };
     app.refresh();
     if args.once && !args.demo {
@@ -627,14 +719,29 @@ fn run_tui(app: &mut App, rx: &mpsc::Receiver<NetMsg>, refresh_ms: u64) -> std::
         let detail = if app.detail_on { app.selected_detail() } else { None };
         let th = &theme::THEMES[app.theme_idx];
         let update = app.update.clone();
+        let series = app.series(ui::graph_points(term.size()?.width, app.panels));
+        let notice = app.notice();
+        let panels = app.panels;
         term.draw(|f| {
             ui::draw(f, th, &app.account, &app.agg, &app.agents, &app.plans, &app.sys,
-                     detail.as_ref(), &mut app.table, sort_label, n_sources, update.as_deref())
+                     detail.as_ref(), &mut app.table, sort_label, n_sources, update.as_deref(),
+                     &series, panels, notice.as_ref().map(|(m, ask)| (m.as_str(), *ask)))
         })?;
 
         let timeout = tick.saturating_sub(last.elapsed());
         if event::poll(timeout)? {
             match event::read()? {
+                // A pending kill takes the next key: y confirms, anything
+                // else (including q) only cancels.
+                Event::Key(k) if k.kind == KeyEventKind::Press && app.confirm.is_some() => {
+                    if let Some(kill) = app.confirm.take() {
+                        if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                            app.do_kill(kill);
+                        } else {
+                            app.flash("kill cancelled");
+                        }
+                    }
+                }
                 Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                     KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -651,6 +758,12 @@ fn run_tui(app: &mut App, rx: &mpsc::Receiver<NetMsg>, refresh_ms: u64) -> std::
                         app.theme_idx = (app.theme_idx + 1) % theme::THEMES.len();
                         theme::save(theme::THEMES[app.theme_idx].name);
                     }
+                    KeyCode::Char('z') => app.zoom = (app.zoom + 1) % ZOOMS.len(),
+                    KeyCode::Char('x') => app.ask_kill(),
+                    KeyCode::Char('1') => app.panels.sys = !app.panels.sys,
+                    KeyCode::Char('2') => app.panels.plan = !app.panels.plan,
+                    KeyCode::Char('3') => app.panels.tokens = !app.panels.tokens,
+                    KeyCode::Char('4') => app.panels.bottom = !app.panels.bottom,
                     KeyCode::Char('r') if !app.no_net => {
                         let cps = app.creds_paths();
                         let txc = app.tx.clone();
@@ -674,7 +787,7 @@ fn run_tui(app: &mut App, rx: &mpsc::Receiver<NetMsg>, refresh_ms: u64) -> std::
                     MouseEventKind::ScrollUp => app.select_prev(),
                     MouseEventKind::Down(MouseButton::Left) => {
                         let size = term.size()?;
-                        if let Some(i) = ui::agents_row_at(size, &app.plans, m.row) {
+                        if let Some(i) = ui::agents_row_at(size, &app.plans, app.panels, m.row) {
                             let i = i + app.table.offset();
                             if i < app.agents.len() {
                                 app.table.select(Some(i));
@@ -725,6 +838,8 @@ fn apply_usage(a: &mut LiveAgent, t: &TreeUsage) {
     a.nprocs = t.nprocs;
     a.detached = t.detached;
     a.top = t.top.clone();
+    a.ports = t.ports.clone();
+    a.pids = t.pids.clone();
 }
 
 /// A row for processes whose `CLAUDE_PID` isn't a live registered session:
@@ -761,6 +876,13 @@ fn stray_agent(s: procs::Stray, stale: &std::collections::HashMap<i32, LiveAgent
             top: Vec::new(),
             burn_tps: 0.0,
             burn_hist: vec![0; 8],
+            ctx_tokens: st.ctx_tokens,
+            ctx_window: st.ctx_window,
+            compactions: st.compactions,
+            action: None,
+            subagents_running: 0,
+            ports: Vec::new(),
+            pids: Vec::new(),
             kind: String::new(),
         },
         None => LiveAgent {
@@ -786,6 +908,13 @@ fn stray_agent(s: procs::Stray, stale: &std::collections::HashMap<i32, LiveAgent
             top: Vec::new(),
             burn_tps: 0.0,
             burn_hist: vec![0; 8],
+            ctx_tokens: 0,
+            ctx_window: 0,
+            compactions: 0,
+            action: None,
+            subagents_running: 0,
+            ports: Vec::new(),
+            pids: Vec::new(),
             kind: String::new(),
         },
     };
@@ -900,16 +1029,22 @@ fn print_once(app: &App) {
         .unwrap_or(4)
         .clamp(4, 44);
     let repo_w = app.agents.iter().map(|a| a.repo.chars().count()).max().unwrap_or(4).clamp(4, 30);
-    println!("  {:<8} {:<name_w$} {:<repo_w$} {:<11} {:<6} {:>8} {:>6} {:>6} {:>5} {:>5} {:>6}",
-        "PID", "SESSION", "REPO", "MODEL", "ST", "UP", "CORES", "MEM", "GPU", "PROCS", "tok/s");
+    println!("  {:<8} {:<name_w$} {:<repo_w$} {:<11} {:<6} {:>4} {:>8} {:>6} {:>6} {:>5} {:>5} {:>6}",
+        "PID", "SESSION", "REPO", "MODEL", "ST", "CTX", "UP", "CORES", "MEM", "GPU", "PROCS", "tok/s");
     for ag in &app.agents {
+        let ctx = if ag.ctx_tokens > 0 {
+            format!("{:.0}%", ag.ctx_tokens as f64 / ag.ctx_window.max(1) as f64 * 100.0)
+        } else {
+            "—".into()
+        };
         println!(
-            "  {:<8} {:<name_w$} {:<repo_w$} {:<11} {:<6} {:>8} {:>6} {:>6} {:>5} {:>5} {:>6}",
+            "  {:<8} {:<name_w$} {:<repo_w$} {:<11} {:<6} {:>4} {:>8} {:>6} {:>6} {:>5} {:>5} {:>6}",
             ag.pid,
             short(if ag.name.is_empty() { &ag.project } else { &ag.name }, name_w),
             short(&ag.repo, repo_w),
             ag.model.strip_prefix("claude-").unwrap_or(&ag.model),
             ag.status,
+            ctx,
             theme::uptime(ag.uptime_secs),
             procs::fmt_cpu(ag.cpu),
             procs::fmt_kb(ag.rss_kb),
@@ -930,6 +1065,17 @@ fn print_once(app: &App) {
                 ui::place_tag(&p.place, &ag.repo), short(&p.cmd, 70));
         }
     }
+    // What each busy agent is running, and who holds ports.
+    for ag in &app.agents {
+        let name = if ag.name.is_empty() { &ag.project } else { &ag.name };
+        if let Some(act) = ag.action.as_ref().filter(|a| a.pending && ag.status == "busy") {
+            println!("  ▸ {}: {} {}", short(name, 30), act.tool, short(&act.arg, 70));
+        }
+        if !ag.ports.is_empty() {
+            let ports: Vec<String> = ag.ports.iter().map(|p| format!(":{p}")).collect();
+            println!("  {} ({}) listens on {}", short(name, 30), ag.status, ports.join(" "));
+        }
+    }
 
     println!();
     let g = &app.agg;
@@ -941,6 +1087,15 @@ fn print_once(app: &App) {
         g.grand_cost,
         theme::human(g.main_tok),
         theme::human(g.agent_tok),
+    );
+    let s = app.series(60);
+    println!(
+        "TOKENS last {}  out {}/s  in {}/s  ({} tok, ${:.2})",
+        theme::span(s.window_secs),
+        theme::human(s.out_now.round() as u64),
+        theme::human(s.inp_now.round() as u64),
+        theme::human(s.tok),
+        s.cost,
     );
     println!("BY MODEL");
     for (m, tok, cost) in g.by_model.iter().take(6) {

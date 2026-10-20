@@ -8,6 +8,8 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::Deserialize;
 
+use crate::model::ToolCall;
+use crate::pricing;
 use crate::procs::{ProcLine, Sampler};
 use crate::transcripts::{self, Store};
 
@@ -64,6 +66,16 @@ pub struct LiveAgent {
     pub top: Vec<ProcLine>,
     pub burn_tps: f64,
     pub burn_hist: Vec<u64>,
+    /// Context in play at the last turn, and the model's window.
+    pub ctx_tokens: u64,
+    pub ctx_window: u64,
+    pub compactions: u32,
+    /// The tool call it is executing, else its latest one.
+    pub action: Option<ToolCall>,
+    pub subagents_running: usize,
+    pub ports: Vec<u16>,
+    /// Every pid of the tree (see `procs::TreeUsage::pids`).
+    pub pids: Vec<i32>,
     #[allow(dead_code)] // "interactive"/"cli"; reserved for a session-kind column
     pub kind: String,
 }
@@ -136,6 +148,11 @@ pub fn read(sessions_dirs: &[(PathBuf, String)], store: &Store, now_ms: i64,
             (handle.clone(), false)
         };
 
+        let st = store.sessions.get(&session_id);
+        let ctx_tokens = st.map(|s| s.ctx_tokens).unwrap_or(0);
+        let ctx_window = pricing::context_window(&model, ctx_tokens);
+        let since = started / 1000;
+
         let agent = LiveAgent {
             pid: sf.pid,
             session_id,
@@ -159,6 +176,15 @@ pub fn read(sessions_dirs: &[(PathBuf, String)], store: &Store, now_ms: i64,
             top: Vec::new(),
             burn_tps,
             burn_hist,
+            ctx_tokens,
+            ctx_window,
+            compactions: st.map(|s| s.compactions).unwrap_or(0),
+            action: st.and_then(|s| s.action()),
+            subagents_running: st
+                .map(|s| s.subagents(now_secs, since).iter().filter(|a| a.running).count())
+                .unwrap_or(0),
+            ports: Vec::new(),
+            pids: vec![sf.pid],
             kind: sf.kind.unwrap_or_default(),
         };
         if alive.is_some() {

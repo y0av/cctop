@@ -5,7 +5,10 @@ use chrono::{Duration, Utc};
 
 use crate::account::Account;
 use crate::procs::{GpuStats, ProcLine, SysStats};
-use crate::model::{AgentDetail, PlanView, ScopedWindow, Spend, Tokens, UsageSource, UsageWindows, Window};
+use crate::model::{
+    AgentDetail, GitStatus, PlanView, ScopedWindow, Series, Spend, SubAgentView, Tokens, ToolCall, UsageSource,
+    UsageWindows, Window,
+};
 use crate::sessions::LiveAgent;
 use crate::transcripts::Aggregates;
 
@@ -100,6 +103,13 @@ pub fn agents(tick: u64) -> Vec<LiveAgent> {
         rss_kb: rss_mb * 1024,
         burn_tps: tps,
         burn_hist: hist,
+        ctx_tokens: 0,
+        ctx_window: 1_000_000,
+        compactions: 0,
+        action: None,
+        subagents_running: 0,
+        ports: Vec::new(),
+        pids: Vec::new(),
         kind: "interactive".into(),
     };
     let mut v = vec![
@@ -121,7 +131,52 @@ pub fn agents(tick: u64) -> Vec<LiveAgent> {
         ag.gpu = Some(gpu as f32);
         ag.top = demo_top(ag.pid, ag.cpu, ag.rss_kb, &ag.project);
     }
+    // Context, the call in flight, subagents and ports: the redesign agent
+    // is close to an auto-compact and its dev server holds two ports.
+    let now = Utc::now().timestamp();
+    let call = |tool: &str, arg: &str, ago: i64, pending: bool| {
+        Some(ToolCall { tool: tool.into(), arg: arg.into(), ts: now - ago, pending })
+    };
+    let set = |ag: &mut LiveAgent, ctx: u64, win: u64, compactions: u32, action, subs: usize, ports: &[u16]| {
+        ag.ctx_tokens = ctx;
+        ag.ctx_window = win;
+        ag.compactions = compactions;
+        ag.action = action;
+        ag.subagents_running = subs;
+        ag.ports = ports.to_vec();
+    };
+    set(&mut v[0], 412_000 + tick * 900, 1_000_000, 0, call("Bash", "cargo test -p gateway --release", 14, true), 2, &[]);
+    set(&mut v[1], 931_000, 1_000_000, 1, call("Edit", "CheckoutForm.tsx", 3, true), 0, &[5173, 9222]);
+    set(&mut v[2], 88_000, 1_000_000, 0, call("Read", "etl/schedule.py", 3480, false), 0, &[]);
+    set(&mut v[3], 61_000, 200_000, 0, call("Bash", "terraform plan -out=tf.plan", 12360, false), 0, &[]);
+    set(&mut v[4], 140_000, 1_000_000, 2, call("Bash", "npm run dev", 21920, false), 0, &[3000]);
     v
+}
+
+/// A synthetic token stream for the live graph: a few overlapping waves
+/// with turn-sized bursts, scrolling one sample per tick.
+pub fn series(tick: u64, points: usize, window: i64) -> Series {
+    let n = points.max(2);
+    let wave = |i: usize, phase: f64| -> f64 {
+        let t = (i as u64 + tick) as f64;
+        let base = ((t * 0.07 + phase).sin() * 0.5 + 0.5) * ((t * 0.023 + phase).cos() * 0.3 + 0.7);
+        // Deterministic "turn finished" bursts.
+        let burst = if (i as u64 + tick).wrapping_mul(2_654_435_761).is_multiple_of(17) { 0.45 } else { 0.0 };
+        (base * 0.8 + burst).min(1.0)
+    };
+    let out: Vec<f64> = (0..n).map(|i| 30.0 + 160.0 * wave(i, 0.0)).collect();
+    let inp: Vec<f64> = (0..n).map(|i| 6_000.0 + 58_000.0 * wave(i, 0.9)).collect();
+    let span = window as f64 / n as f64;
+    let tok = ((out.iter().sum::<f64>() + inp.iter().sum::<f64>()) * span) as u64;
+    Series {
+        out_now: out[n - 1],
+        inp_now: inp[n - 1],
+        out,
+        inp,
+        window_secs: window,
+        tok,
+        cost: tok as f64 / 1e6 * 1.9,
+    }
 }
 
 fn demo_top(pid: i32, cpu: f32, rss_kb: u64, project: &str) -> Vec<ProcLine> {
@@ -200,6 +255,21 @@ pub fn detail(a: &LiveAgent) -> AgentDetail {
         cost: 12.41,
         burn_tps: a.burn_tps,
         burn_hist: a.burn_hist.clone(),
+        ctx_tokens: a.ctx_tokens,
+        ctx_window: a.ctx_window,
+        compactions: a.compactions,
+        action: a.action.clone(),
+        subagents: if a.subagents_running > 0 {
+            vec![
+                SubAgentView { kind: "Explore".into(), desc: "map retry paths in middleware".into(), tokens: 412_000, running: true },
+                SubAgentView { kind: "general-purpose".into(), desc: "load test for the limiter".into(), tokens: 286_000, running: true },
+                SubAgentView { kind: "Explore".into(), desc: "find rate-limit config".into(), tokens: 91_000, running: false },
+            ]
+        } else {
+            Vec::new()
+        },
+        ports: a.ports.clone(),
+        git: Some(GitStatus { branch: "fix/rate-limit".into(), ahead: 2, behind: 0, changed: 3, untracked: 1 }),
     }
 }
 

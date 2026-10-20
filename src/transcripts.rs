@@ -13,7 +13,7 @@ use std::time::{Instant, SystemTime};
 use chrono::DateTime;
 use serde_json::Value;
 
-use crate::model::Tokens;
+use crate::model::{Series, SubAgentView, ToolCall, Tokens};
 use crate::pricing;
 
 /// One de-duplicated assistant turn.
@@ -25,6 +25,77 @@ pub struct Record {
     pub sidechain: bool,
     pub tok: Tokens,
     pub cost: f64,
+}
+
+/// Live state of one session, from the tail of its transcript: what the
+/// context weighs, what it is running, which subagents it spawned.
+#[derive(Default)]
+pub struct SessionState {
+    /// Tokens in play at the latest main-chain turn: everything the model
+    /// read (input + cache reads and writes) plus what it wrote.
+    pub ctx_tokens: u64,
+    ctx_ts: i64,
+    /// Auto or manual `/compact` runs.
+    pub compactions: u32,
+    last_tool: Option<ToolCall>,
+    /// Main-chain tool calls still waiting for their result, by tool_use id.
+    pending: HashMap<String, ToolCall>,
+    subagents: HashMap<String, SubAgent>,
+}
+
+struct SubAgent {
+    kind: String,
+    desc: String,
+    /// The parent's Agent tool call that started it; pending while it runs
+    /// in the foreground.
+    tool_use_id: String,
+    tokens: u64,
+    last_ts: i64,
+}
+
+/// A subagent counts as running while its parent waits on it, or while its
+/// own transcript is still moving (background agents return at once).
+const SUBAGENT_LIVE_SECS: i64 = 60;
+
+impl SessionState {
+    /// The call the agent is executing, else its latest one.
+    pub fn action(&self) -> Option<ToolCall> {
+        self.pending
+            .values()
+            .max_by_key(|c| c.ts)
+            .or(self.last_tool.as_ref())
+            .cloned()
+    }
+
+    /// Subagents touched since `since`, running first, then most recent.
+    pub fn subagents(&self, now: i64, since: i64) -> Vec<SubAgentView> {
+        let mut v: Vec<(&SubAgent, bool)> = self
+            .subagents
+            .values()
+            .filter(|a| a.last_ts >= since)
+            .map(|a| {
+                let running = self.pending.contains_key(&a.tool_use_id)
+                    || now - a.last_ts < SUBAGENT_LIVE_SECS;
+                (a, running)
+            })
+            .collect();
+        v.sort_by(|x, y| y.1.cmp(&x.1).then(y.0.last_ts.cmp(&x.0.last_ts)));
+        v.into_iter()
+            .map(|(a, running)| SubAgentView {
+                kind: a.kind.clone(),
+                desc: a.desc.clone(),
+                tokens: a.tokens,
+                running,
+            })
+            .collect()
+    }
+}
+
+/// What a subagent's `.meta.json` says about it.
+struct AgentMeta {
+    kind: String,
+    desc: String,
+    tool_use_id: String,
 }
 
 struct FileState {
@@ -60,6 +131,9 @@ pub struct Store {
     /// session id -> (priority, title). A title you set beats the generated
     /// one; within a priority the latest line wins.
     pub session_title: HashMap<String, (u8, String)>,
+    pub sessions: HashMap<String, SessionState>,
+    /// Subagent id -> its meta file, read once when the transcript appears.
+    agent_meta: HashMap<String, AgentMeta>,
 }
 
 /// Title priorities: Claude's generated title < an agent name < `/rename`.
@@ -80,6 +154,8 @@ impl Store {
             records: Vec::new(),
             session_model: HashMap::new(),
             session_title: HashMap::new(),
+            sessions: HashMap::new(),
+            agent_meta: HashMap::new(),
         }
     }
 
@@ -202,6 +278,9 @@ impl Store {
     }
 
     fn ingest_file(&mut self, path: &Path, len: u64, mtime: SystemTime) -> std::io::Result<()> {
+        if !self.files.contains_key(path) {
+            self.read_agent_meta(path);
+        }
         let state = self
             .files
             .entry(path.to_path_buf())
@@ -241,6 +320,36 @@ impl Store {
         Ok(())
     }
 
+    /// Subagent transcripts live at `<session>/subagents/agent-<id>.jsonl`
+    /// next to an `agent-<id>.meta.json` naming the agent type and task.
+    fn read_agent_meta(&mut self, path: &Path) {
+        let in_subagents = path.parent().and_then(Path::file_name).is_some_and(|n| n == "subagents");
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.strip_prefix("agent-")) else {
+            return;
+        };
+        if !in_subagents {
+            return;
+        }
+        let Some(v) = std::fs::read_to_string(path.with_extension("meta.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        else {
+            return;
+        };
+        let get = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        self.agent_meta.insert(
+            id.to_string(),
+            AgentMeta { kind: get("agentType"), desc: get("description"), tool_use_id: get("toolUseId") },
+        );
+    }
+
+    /// Insert into the dedup set; false when the key was already counted.
+    fn first_sight(&mut self, key: &str) -> bool {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        self.seen.insert(hasher.finish())
+    }
+
     fn ingest_line(&mut self, line: &str) {
         let v: Value = match serde_json::from_str(line) {
             Ok(v) => v,
@@ -264,13 +373,98 @@ impl Store {
             }
             return;
         }
-        if kind != "assistant" {
-            return;
+        let session = v.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
+        let sidechain = v.get("isSidechain").and_then(Value::as_bool).unwrap_or(false);
+        let ts = v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.timestamp())
+            .unwrap_or(0);
+        let content = v.get("message").and_then(|m| m.get("content")).and_then(Value::as_array);
+        match kind {
+            "system" => {
+                let compact = v.get("subtype").and_then(Value::as_str) == Some("compact_boundary");
+                let uuid = v.get("uuid").and_then(Value::as_str).unwrap_or("");
+                if compact && !sidechain && !session.is_empty() && self.first_sight(uuid) {
+                    self.sessions.entry(session).or_default().compactions += 1;
+                }
+                return;
+            }
+            "user" => {
+                // Tool results close the calls they answer.
+                if sidechain || session.is_empty() {
+                    return;
+                }
+                let Some(blocks) = content else { return };
+                let Some(st) = self.sessions.get_mut(&session) else { return };
+                for b in blocks {
+                    if b.get("type").and_then(Value::as_str) == Some("tool_result") {
+                        if let Some(id) = b.get("tool_use_id").and_then(Value::as_str) {
+                            st.pending.remove(id);
+                        }
+                    }
+                }
+                return;
+            }
+            "assistant" => {}
+            _ => return,
         }
         let msg = match v.get("message") {
             Some(m) => m,
             None => return,
         };
+        let agent_id = v.get("agentId").and_then(Value::as_str).filter(|_| sidechain);
+
+        // Tool calls come before the dedup below: Claude Code writes one line
+        // per content block, all sharing the message id.
+        if !session.is_empty() {
+            let calls: Vec<(String, ToolCall)> = content
+                .into_iter()
+                .flatten()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+                .map(|b| {
+                    let id = b.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                    let name = b.get("name").and_then(Value::as_str).unwrap_or("?");
+                    let (tool, arg) = describe_tool(name, b.get("input").unwrap_or(&Value::Null));
+                    (id, ToolCall { tool, arg, ts, pending: true })
+                })
+                .collect();
+            let st = self.sessions.entry(session.clone()).or_default();
+            match agent_id {
+                Some(aid) => {
+                    let meta = self.agent_meta.get(aid);
+                    let sa = st.subagents.entry(aid.to_string()).or_insert_with(|| SubAgent {
+                        kind: meta.map(|m| m.kind.clone()).unwrap_or_default(),
+                        desc: meta.map(|m| m.desc.clone()).unwrap_or_default(),
+                        tool_use_id: meta.map(|m| m.tool_use_id.clone()).unwrap_or_default(),
+                        tokens: 0,
+                        last_ts: 0,
+                    });
+                    sa.last_ts = sa.last_ts.max(ts);
+                }
+                None if !sidechain => {
+                    for (id, call) in calls {
+                        if st.last_tool.as_ref().is_none_or(|t| ts >= t.ts) {
+                            st.last_tool = Some(ToolCall { pending: false, ..call.clone() });
+                        }
+                        if !id.is_empty() {
+                            st.pending.insert(id, call);
+                        }
+                    }
+                    // An interrupted run can leave calls unanswered; keep
+                    // the set from growing without bound.
+                    while st.pending.len() > 32 {
+                        let oldest = st.pending.iter().min_by_key(|(_, c)| c.ts).map(|(k, _)| k.clone());
+                        match oldest {
+                            Some(k) => st.pending.remove(&k),
+                            None => break,
+                        };
+                    }
+                }
+                None => {}
+            }
+        }
 
         // Dedup on (message.id, requestId): the same turn is written multiple
         // times across streaming/resume. Fall back to the line uuid if absent.
@@ -284,9 +478,7 @@ impl Store {
         if key.is_empty() {
             return;
         }
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        if !self.seen.insert(hasher.finish()) {
+        if !self.first_sight(&key) {
             return; // already counted
         }
 
@@ -309,14 +501,6 @@ impl Store {
 
         let model = msg.get("model").and_then(Value::as_str).unwrap_or("?").to_string();
         let cwd = v.get("cwd").and_then(Value::as_str).unwrap_or("").to_string();
-        let session = v.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
-        let sidechain = v.get("isSidechain").and_then(Value::as_bool).unwrap_or(false);
-        let ts = v
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|d| d.timestamp())
-            .unwrap_or(0);
 
         // Track the session's model from any line (incl. zero-token ones) so a
         // freshly-started agent still resolves a model in the live table.
@@ -331,6 +515,21 @@ impl Store {
         // and only add noise to the breakdowns — skip them.
         if tok.total() == 0 {
             return;
+        }
+
+        if let Some(st) = self.sessions.get_mut(&session) {
+            match agent_id {
+                Some(aid) => {
+                    if let Some(sa) = st.subagents.get_mut(aid) {
+                        sa.tokens += tok.total();
+                    }
+                }
+                None if !sidechain && ts >= st.ctx_ts => {
+                    st.ctx_tokens = tok.total();
+                    st.ctx_ts = ts;
+                }
+                None => {}
+            }
         }
 
         let cost = pricing::cost(&model, &tok);
@@ -354,6 +553,52 @@ impl Store {
         }
         let tps = out as f64 / window as f64;
         (tps, hist)
+    }
+
+    /// Token throughput across every session over the trailing `window`
+    /// seconds, in `points` buckets for the live graph. Buckets are anchored
+    /// to absolute time so the graph scrolls instead of reshuffling, and
+    /// each is a trailing ~30 s average: a turn lands its tokens at one
+    /// instant, which would otherwise draw as a lone spike.
+    pub fn token_series(&self, now: i64, window: i64, points: usize) -> Series {
+        let points = points.max(2);
+        let span = (window as f64 / points as f64).max(1.0);
+        let last = (now as f64 / span).floor() as i64;
+        let first = last - points as i64 + 1;
+        let start = (first as f64 * span) as i64;
+        let mut out = vec![0f64; points];
+        let mut inp = vec![0f64; points];
+        let (mut out_min, mut inp_min, mut tok, mut cost) = (0u64, 0u64, 0u64, 0f64);
+        for r in &self.records {
+            if r.ts < start || r.ts > now {
+                continue;
+            }
+            let read = r.tok.input + r.tok.cache_read + r.tok.cache_write_5m + r.tok.cache_write_1h;
+            let i = ((r.ts as f64 / span).floor() as i64 - first).clamp(0, points as i64 - 1) as usize;
+            out[i] += r.tok.output as f64;
+            inp[i] += read as f64;
+            tok += r.tok.total();
+            cost += r.cost;
+            if now - r.ts < 60 {
+                out_min += r.tok.output;
+                inp_min += read;
+            }
+        }
+        let k = ((30.0 / span).round() as usize).max(1);
+        let smooth = |v: &[f64]| -> Vec<f64> {
+            (0..v.len())
+                .map(|i| v[i.saturating_sub(k - 1)..=i].iter().sum::<f64>() / (k as f64 * span))
+                .collect()
+        };
+        Series {
+            out: smooth(&out),
+            inp: smooth(&inp),
+            window_secs: window,
+            out_now: out_min as f64 / 60.0,
+            inp_now: inp_min as f64 / 60.0,
+            tok,
+            cost,
+        }
     }
 
     /// Roll up everything into the numbers the UI panels need.
@@ -460,6 +705,46 @@ pub struct Aggregates {
     pub last7d_cost: f64,
     pub grand_tok: u64,
     pub grand_cost: f64,
+}
+
+/// A tool call as `(tool, what it touches)`: `Bash` + the command, `Edit` +
+/// the file name, `Agent` + the task description, `mcp__srv__op` → `srv:op`.
+fn describe_tool(name: &str, input: &Value) -> (String, String) {
+    let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
+    let file = |k: &str| s(k).trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string();
+    let arg = match name {
+        "Bash" => {
+            let first = s("command").lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+            let mut cmd = first.split_whitespace().collect::<Vec<_>>().join(" ");
+            // The folder shows elsewhere; `cd x && make` reads as `make`.
+            if cmd.starts_with("cd ") {
+                if let Some(i) = cmd.find("&& ") {
+                    cmd = cmd[i + 3..].to_string();
+                }
+            }
+            cmd
+        }
+        "Read" | "Write" | "Edit" | "MultiEdit" => file("file_path"),
+        "NotebookEdit" => file("notebook_path"),
+        "Grep" | "Glob" => s("pattern").to_string(),
+        "WebSearch" => s("query").to_string(),
+        "WebFetch" => {
+            let url = s("url");
+            url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("").to_string()
+        }
+        "Agent" | "Task" => {
+            let d = s("description");
+            if d.is_empty() { s("subagent_type").to_string() } else { d.to_string() }
+        }
+        "Skill" => s("skill").to_string(),
+        _ => String::new(),
+    };
+    let tool = match name.strip_prefix("mcp__") {
+        Some(rest) => rest.replacen("__", ":", 1),
+        None => name.to_string(),
+    };
+    // Bounded: a heredoc command can be kilobytes.
+    (tool, arg.chars().take(160).collect())
 }
 
 /// Model family label for the scoped-weekly estimate rows.
