@@ -586,8 +586,10 @@ fn main() {
     };
 
     if let Some(path) = &args.snapshot {
-        let height = if args.snapshot_multi { 33 } else { 29 };
-        std::fs::write(path, snapshot::html(100, height, &theme::THEMES[theme_idx], args.snapshot_multi))
+        // 120 columns is the narrowest width with every footer hint and the
+        // table's tool-call text; the heights fit the drill-down and plans.
+        let height = if args.snapshot_multi { 40 } else { 34 };
+        std::fs::write(path, snapshot::html(120, height, &theme::THEMES[theme_idx], args.snapshot_multi))
             .expect("write snapshot html");
         return;
     }

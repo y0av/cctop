@@ -160,8 +160,14 @@ pub fn series(tick: u64, points: usize, window: i64) -> Series {
     let wave = |i: usize, phase: f64| -> f64 {
         let t = (i as u64 + tick) as f64;
         let base = ((t * 0.07 + phase).sin() * 0.5 + 0.5) * ((t * 0.023 + phase).cos() * 0.3 + 0.7);
-        // Deterministic "turn finished" bursts.
-        let burst = if (i as u64 + tick).wrapping_mul(2_654_435_761).is_multiple_of(17) { 0.45 } else { 0.0 };
+        // Deterministic "turn finished" bursts, smeared over a few points the
+        // way the live series' trailing average smears them.
+        let hit = |k: u64| (k.wrapping_mul(2_654_435_761) >> 13).is_multiple_of(11);
+        let at = i as u64 + tick;
+        let burst = (0..3u64)
+            .filter(|&k| at >= k && hit(at - k))
+            .map(|k| 0.45 * (1.0 - k as f64 / 3.0))
+            .fold(0.0, f64::max);
         (base * 0.8 + burst).min(1.0)
     };
     let out: Vec<f64> = (0..n).map(|i| 30.0 + 160.0 * wave(i, 0.0)).collect();
